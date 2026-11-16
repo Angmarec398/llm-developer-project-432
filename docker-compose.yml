@@ -1,0 +1,77 @@
+name: card-pipeline-z2
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: card
+      POSTGRES_PASSWORD: card
+      POSTGRES_DB: card
+    ports:
+      - "${PG_PORT:-5432}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U card -d card"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  rabbitmq:
+    image: rabbitmq:3.13-management
+    environment:
+      RABBITMQ_DEFAULT_USER: card
+      RABBITMQ_DEFAULT_PASS: card
+    ports:
+      - "5672:5672"    # AMQP
+      - "15672:15672"  # Management UI: http://localhost:15672 (card/card)
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  temporal:
+    image: temporalio/auto-setup:1.29.1
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      - DB=postgres12
+      - DB_PORT=5432
+      - POSTGRES_USER=card
+      - POSTGRES_PWD=card
+      - POSTGRES_SEEDS=postgres
+      - DYNAMIC_CONFIG_FILE_PATH=config/dynamicconfig/development-sql.yaml
+    ports:
+      - "7233:7233"
+    volumes:
+      - ./dynamicconfig:/etc/temporal/config/dynamicconfig
+    healthcheck:
+      test: ["CMD-SHELL", "tctl --address $$(hostname -i):7233 cluster health"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+
+  temporal-ui:
+    image: temporalio/ui:2.34.0
+    depends_on:
+      temporal:
+        condition: service_healthy
+    environment:
+      - TEMPORAL_ADDRESS=temporal:7233
+    ports:
+      - "8233:8080"
+
+  temporal-admin-tools:
+    image: temporalio/admin-tools:1.29.1-tctl-1.18.4-cli-1.5.0
+    depends_on:
+      - temporal
+    environment:
+      - TEMPORAL_ADDRESS=temporal:7233
+    entrypoint: sleep infinity
+    init: true
+
+volumes:
+  pgdata:
