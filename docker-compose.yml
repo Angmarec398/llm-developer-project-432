@@ -17,19 +17,6 @@ services:
       timeout: 3s
       retries: 10
 
-  rabbitmq:
-    image: rabbitmq:3.13-management
-    environment:
-      RABBITMQ_DEFAULT_USER: card
-      RABBITMQ_DEFAULT_PASS: card
-    ports:
-      - "5672:5672"    # AMQP
-      - "15672:15672"  # Management UI: http://localhost:15672 (card/card)
-    healthcheck:
-      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
-      interval: 10s
-      timeout: 5s
-      retries: 10
 
   temporal:
     image: temporalio/auto-setup:1.29.1

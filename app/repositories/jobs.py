@@ -8,6 +8,7 @@ import uuid
 from datetime import UTC, datetime
 
 import psycopg
+from pydantic import ValidationError
 
 from app.schemas.cards import CardDraft
 
@@ -16,8 +17,15 @@ def _now() -> str:
     return datetime.now(UTC).isoformat()
 
 
-def create_job(conn: psycopg.Connection, payload: dict, idempotency_key: str | None) -> str:
-    """Создание idempotency_key (уникального ключа).  При повторном обращении возвращает существующий id."""
+def create_job(
+    conn: psycopg.Connection, payload: dict, idempotency_key: str | None
+) -> tuple[str, bool]:
+    """Создать задачу с ключом идемпотентности.
+
+    Возвращает (job_id, created): created=True — задача создана сейчас,
+    created=False — задача с таким ключом уже существовала, вернулся её id
+    (повторный запуск фоновой работы в этом случае делать нельзя).
+    """
     with conn.cursor() as cur:
         if idempotency_key:
             cur.execute(
@@ -25,13 +33,14 @@ def create_job(conn: psycopg.Connection, payload: dict, idempotency_key: str | N
             )
             row = cur.fetchone()
             if row:
-                return row[0]
+                return row[0], False
         job_id = uuid.uuid4().hex[:12]
         cur.execute(
             "INSERT INTO jobs (id, idempotency_key, payload) VALUES (%s, %s, %s)",
             (job_id, idempotency_key, json.dumps(payload)),
         )
-        return job_id
+        return job_id, True
+
 
 
 def set_status(
@@ -74,6 +83,6 @@ def get_job(conn: psycopg.Connection, job_id: str) -> dict | None:
                 else CardDraft.model_validate_json(row[3])
             )
             job_info["result"] = draft.model_dump()
-        except Exception:
+        except ValidationError:
             job_info["result"] = None
     return job_info

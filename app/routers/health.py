@@ -1,6 +1,8 @@
 """Проверки живости и готовности приложения."""
+import psycopg
 from fastapi import APIRouter
 from fastapi.responses import JSONResponse
+from psycopg_pool import PoolTimeout
 
 from app.core.db import connection
 
@@ -24,7 +26,7 @@ async def readiness():
             row = conn.execute(
                 "SELECT extversion FROM pg_extension WHERE extname = 'vector'"
             ).fetchone()
-    except Exception:
+    except (psycopg.Error, PoolTimeout):
         return JSONResponse(
             {"status": "error", "database": "unavailable"}, status_code=503
         )

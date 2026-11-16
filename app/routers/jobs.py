@@ -1,46 +1,82 @@
-"""Фоновый вариант: job в RabbitMQ → Celery-воркер (шаги 2-3 практики)."""
+"""Фоновый вариант: задача в БД + устойчивый процесс в Temporal.
+
+Идемпотентность двойная: на уровне БД (ключ идемпотентности) и на
+уровне движка (workflow_id детерминированно выводится из job_id —
+повторный старт с тем же id Temporal не выполнит).
+"""
 from fastapi import APIRouter, Header, HTTPException
 from fastapi.responses import JSONResponse
+from temporalio.service import RPCError, RPCStatusCode
 
+from app.core.config import settings
 from app.core.db import connection
-from app.schemas.cards import JobIn
 from app.repositories import jobs as jobs_repo
-from app.workers.celery_app import celery_app
+from app.schemas.cards import JobIn
+from app.temporal.client import get_client
 
 router = APIRouter(tags=["jobs"])
 
+async def _signal(job_id: str, signal: str) -> None:
+    """Послать сигнал процессу задачи.
+
+    404 — процесса с таким id нет, 409 — процесс уже завершён.
+    """
+    client = await get_client()
+    handle = client.get_workflow_handle(f"card-{job_id}")
+    try:
+        await handle.signal(signal)
+    except RPCError as exc:
+        if exc.status == RPCStatusCode.NOT_FOUND:
+            if "already completed" in str(exc):
+                raise HTTPException(409, "workflow already completed") from exc
+            raise HTTPException(404, "workflow not found") from exc
+        raise
 
 @router.post("/jobs", status_code=202)
 async def create_job(
     body: JobIn,
-    idempotency_key: str | None = Header(
-        default=None, alias="Idempotency-Key"),
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
 ):
-    """Создание задачи в очереди"""
-    with connection() as conn:
-        try:
-            job_id = jobs_repo.create_job(
-                conn, {"supplier_text": body.supplier_text}, idempotency_key
-            )
-        finally:
-            conn.close()
-        celery_app.send_task(
-            "app.workers.tasks.generate_card",
-            kwargs={"job_id": job_id, "supplier_text": body.supplier_text},
-            queue="card.generate",
-        )
-        return JSONResponse({"id": job_id, "status": "pending"}, status_code=202)
+    """Создать задачу генерации карточки и запустить её процесс в движке.
 
+    Повтор с тем же Idempotency-Key возвращает существующую задачу
+    без нового запуска процесса.
+    """
+    with connection() as conn:
+        job_id, created = jobs_repo.create_job(
+            conn, {"supplier_text": body.supplier_text}, idempotency_key
+        )
+    if created:
+        client = await get_client()
+        await client.start_workflow(
+            "CardWorkflow",
+            args=[body.supplier_text, job_id],
+            id=f"card-{job_id}",
+            task_queue=settings.temporal_task_queue,
+        )
+    return JSONResponse({"id": job_id, "status": "pending"}, status_code=202)
 
 
 @router.get("/jobs/{job_id}")
 async def get_job(job_id: str):
+    """Вернуть текущий статус задачи из БД (404, если задачи нет)."""
     with connection() as conn:
-        try:
-            job = jobs_repo.get_job(conn, job_id)
-        finally:
-            conn.close()
-        if not job:
-            raise HTTPException(404, "job not found")
-        return job
-    
+        job = jobs_repo.get_job(conn, job_id)
+    if not job:
+        raise HTTPException(404, "job not found")
+    return job
+
+
+@router.post("/jobs/{job_id}/approve")
+async def approve_job(job_id: str):
+    """Подтвердить карточку: процесс завершится со статусом approved."""
+    await _signal(job_id, "approve")
+    return {"id": job_id, "signaled": "approve"}
+
+
+@router.post("/jobs/{job_id}/reject")
+async def reject_job(job_id: str):
+    """Отклонить карточку: процесс завершится со статусом rejected."""
+    await _signal(job_id, "request_changes")
+    return {"id": job_id, "signaled": "request_changes"}
+

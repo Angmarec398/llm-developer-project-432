@@ -7,9 +7,14 @@ retry-политика, таймаут, различие ошибок 429/5xx/4x
 import asyncio
 import random
 
-from agents import Agent, Runner
+from agents import (
+    Agent,
+    Runner,
+    set_default_openai_api,
+    set_default_openai_client,
+    set_tracing_disabled,
+)
 from openai import APIConnectionError, APIStatusError, APITimeoutError, AsyncOpenAI
-from agents import set_default_openai_api, set_default_openai_client, set_tracing_disabled
 
 from app.core.config import settings
 from app.core.logging import get_logger
@@ -24,6 +29,8 @@ def setup_llm() -> None:
     Вызывается один раз на процесс. Идемпотентна.
     """
     global _client_configured
+    if _client_configured:
+        return
     client = AsyncOpenAI(
         base_url=settings.llm_base_url,
         api_key=settings.llm_api_key,
@@ -33,7 +40,7 @@ def setup_llm() -> None:
     set_default_openai_api("chat_completions")   # LM Studio не знает Responses API
     set_tracing_disabled(True)                    # иначе 401 на не-OpenAI ключе
     _client_configured = True
-    return client
+    
 
 
 def _retryable(exc: Exception) -> bool:
@@ -52,33 +59,30 @@ async def run_agent(agent: Agent, prompt: str):
     """Запустить агента с ретраями: экспоненциальная задержка + jitter.
     Ретраится только вызов LLM — не вся бизнес-задача (это работа очереди/workflow).
     """
-    client = setup_llm()
+    setup_llm()
     max_retries = settings.llm_max_retries
-    try:
-        for attempt in range(1, max_retries + 1):
-            try:
-                result = await asyncio.wait_for(
-                    Runner.run(agent, prompt), timeout=settings.llm_timeout_s
-                )
-                return result.final_output
-            except Exception as exc:
-                if attempt == max_retries or not _retryable(exc):
-                    log.error(
-                        "llm_call_failed",
-                        agent=agent.name,
-                        attempt=attempt,
-                        error=repr(exc),
-                    )
-                    raise
-                delay = min(2**attempt * 0.5, 8.0) * (1 + random.random() * 0.25)
-                log.warning(
-                    "llm_call_retry",
+    for attempt in range(1, max_retries + 1):
+        try:
+            result = await asyncio.wait_for(
+                Runner.run(agent, prompt), timeout=settings.llm_timeout_s
+            )
+            return result.final_output
+        except Exception as exc:
+            if attempt == max_retries or not _retryable(exc):
+                log.error(
+                    "llm_call_failed",
                     agent=agent.name,
                     attempt=attempt,
-                    delay_s=round(delay, 2),
                     error=repr(exc),
                 )
-                await asyncio.sleep(delay)
-    finally:
-        await client.close()
+                raise
+            delay = min(2**attempt * 0.5, 8.0) * (1 + random.random() * 0.25)
+            log.warning(
+                "llm_call_retry",
+                agent=agent.name,
+                attempt=attempt,
+                delay_s=round(delay, 2),
+                error=repr(exc),
+            )
+            await asyncio.sleep(delay)
 

@@ -20,11 +20,11 @@ temporal-show:
 api:
 	uvicorn app.main:app --reload --port 8000
 
-worker:
-	celery -A app.workers.celery_app worker -Q card.generate,card.critique --pool=solo -l info
-
 temporal-worker:
 	python -m app.temporal_worker
 
 migrate:
 	python -m app.core.migrate
+
+lint:
+	ruff check app tests

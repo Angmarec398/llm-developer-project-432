@@ -44,12 +44,11 @@ def _apply(conn: psycopg.Connection, path: Path) -> None:
     и миграция применится повторно при следующем запуске.
     """
     version = path.stem
-    with conn.transaction():
-        with conn.cursor() as cur:
-            cur.execute(path.read_text(encoding="utf-8"))
-            cur.execute(
-                "INSERT INTO schema_migrations (version) VALUES (%s)", (version,)
-            )
+    with conn.transaction(), conn.cursor() as cur:
+        cur.execute(path.read_text(encoding="utf-8"))
+        cur.execute(
+            "INSERT INTO schema_migrations (version) VALUES (%s)", (version,)
+        )
     print(f"применена миграция: {version}")
     log.info("migration_applied", version=version)
 

@@ -9,7 +9,6 @@ class Settings(BaseSettings):
     llm_model: str = "gemma-4-e4b-it"
 
     database_url: str = "postgresql://card:card@localhost:5432/card"
-    rabbitmq_url: str = "amqp://card:card@localhost:5672//"
 
     temporal_host: str = "localhost:7233"
     temporal_task_queue: str = "card-queue"
