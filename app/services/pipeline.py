@@ -6,76 +6,78 @@
 - Temporal activity (шаг 4).
 Это и есть выигрыш слоистой архитектуры.
 """
-from app.agents.prompts import critic_agent, extractor_agent, generator_agent
+from app.agents.prompts import card_agent, critic_agent, extractor_agent
+from app.core.config import settings
 from app.core.logging import get_logger
-from app.llm.client import run_agent
-from app.schemas.cards import CardDraft, CritiqueReport, SupplierFacts
+from app.schemas.cards import CritiqueReport, ProductCard, SupplierFacts
+from app.services.structured import call_validated
 
 log = get_logger(__name__)
 
 
 async def extract(supplier_text: str) -> SupplierFacts:
-    """Функция запуска извлечения фактов из текста"""
+    """Извлечь факты из текста поставщика (с лечением ответа)."""
     log.info("step_extract_start")
-    out = await run_agent(extractor_agent, supplier_text)
-    if isinstance(out, SupplierFacts):
-        return out
-    return SupplierFacts.model_validate_json(_ensure_json(out))
+    return await call_validated(extractor_agent, supplier_text, SupplierFacts)
 
 
-async def generate(facts: SupplierFacts, feedback: list[str] | None = None) -> CardDraft:
-    """Функция запуска генерации черновика текста для карточки товара"""
-    prompt = "Факты о товаре:\n" + facts.model_dump_json(indent=2)
-    if feedback:
-        prompt += "\n\nЗамечания критика, учти:\n" + "\n".join(f"- {i}" for i in feedback)
-    log.info("step_generate_start", feedback=bool(feedback))
-    out = await run_agent(generator_agent, prompt)
-    if isinstance(out, CardDraft):
-        return out
-    return CardDraft.model_validate_json(_ensure_json(out))
-
-
-async def critique(facts: SupplierFacts, draft: CardDraft) -> CritiqueReport:
-    """Запуск критика черновика текста по определенным правилам"""
+async def generate_card(
+    facts: SupplierFacts,
+    feedback: list[str] | None = None,
+    source_name: str = "supplier_text",
+) -> ProductCard:
+    """Сгенерировать карточку по контракту шага 4 (с лечением ответа)."""
     prompt = (
         "Факты о товаре:\n"
         + facts.model_dump_json(indent=2)
-        + "\n\nЧерновик карточки для проверки:\n"
-        + draft.model_dump_json(indent=2)
+        + f"\nИсточник: {source_name}"
+    )
+    if feedback:
+        prompt += "\n\nЗамечания критика, учти:\n" + "\n".join(
+            f"- {issue}" for issue in feedback
+        )
+    log.info("step_generate_start", feedback=bool(feedback))
+    return await call_validated(card_agent, prompt, ProductCard)
+
+
+async def critique(facts: SupplierFacts, card: ProductCard) -> CritiqueReport:
+    """Проверить карточку по правилам (с лечением ответа)."""
+    prompt = (
+        "Факты о товаре:\n"
+        + facts.model_dump_json(indent=2)
+        + "\n\nКарточка для проверки:\n"
+        + card.model_dump_json(indent=2)
     )
     log.info("step_critique_start")
-    out = await run_agent(critic_agent, prompt)
-    if isinstance(out, CritiqueReport):
-        return out
-    return CritiqueReport.model_validate_json(_ensure_json(out))
-
-
-def _ensure_json(text) -> str:
-    """Локальные модели иногда оборачивают JSON в ```json ... ``` — срезаем."""
-    clear_text = str(text).strip()
-    if clear_text.startswith("```"):
-        clear_text = clear_text.split("\n", 1)[1] if "\n" in clear_text else clear_text
-        clear_text = clear_text.rsplit("```", 1)[0]
-    return clear_text.strip()
+    return await call_validated(critic_agent, prompt, CritiqueReport)
 
 
 async def run_pipeline(supplier_text: str, max_attempts: int = 3):
     """Полный цикл: extract → (generate → critique → feedback)* → итог.
 
-    Возвращает (итоговый черновик, число генераций, вердикт).
+    Возвращает (карточку, число генераций, вердикт).
+    Вердикт: approved — критик доволен и уверенность выше порога;
+    low_confidence — критик доволен, но уверенность ниже порога,
+    карточку должен посмотреть человек; rejected — петля исчерпана.
     """
     facts = await extract(supplier_text)
     feedback: list[str] = []
     attempts = 0
-    draft = None
+    card = None
     verdict = "rejected"
     while attempts < max_attempts:
         attempts += 1
-        draft = await generate(facts, feedback or None)
-        report = await critique(facts, draft)
+        card = await generate_card(facts, feedback or None)
+        report = await critique(facts, card)
         if report.verdict == "approve":
             verdict = "approved"
             break
         feedback = report.issues
         log.info("pipeline_regenerate", attempt=attempts, issues=report.issues)
-    return draft, attempts, verdict
+    if (
+        verdict == "approved"
+        and card.confidence < settings.card_confidence_threshold
+    ):
+        verdict = "low_confidence"
+        log.info("pipeline_low_confidence", confidence=card.confidence)
+    return card, attempts, verdict

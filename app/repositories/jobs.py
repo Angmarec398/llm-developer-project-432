@@ -1,7 +1,8 @@
 """Repository-слой: таблица jobs в Postgres.
 
 Единственный владелец SQL. Статусная машина:
-pending → extracting → generating → critiquing → (regenerating) → approved | rejected | failed
+pending → extracting → generating → critiquing → (regenerating)
+→ done | awaiting_confirmation → approved | rejected | failed
 """
 import json
 import uuid
@@ -10,7 +11,7 @@ from datetime import UTC, datetime
 import psycopg
 from pydantic import ValidationError
 
-from app.schemas.cards import CardDraft
+from app.schemas.cards import ProductCard
 
 
 def _now() -> str:
@@ -44,7 +45,7 @@ def create_job(
 
 
 def set_status(
-    conn: psycopg.Connection, job_id: str, status: str, *, result: CardDraft | None = None,
+    conn: psycopg.Connection, job_id: str, status: str, *, result: ProductCard | None = None,
     error: str | None = None, bump_attempts: bool = False,
 ) -> None:
     """Сохранение информации о статусе обработки заявки в базе данных"""
@@ -78,9 +79,9 @@ def get_job(conn: psycopg.Connection, job_id: str) -> dict | None:
         # psycopg3 возвращает JSONB уже как dict, а не строку
         try:
             draft = (
-                CardDraft.model_validate(row[3])
+                ProductCard.model_validate(row[3])
                 if isinstance(row[3], dict)
-                else CardDraft.model_validate_json(row[3])
+                else ProductCard.model_validate_json(row[3])
             )
             job_info["result"] = draft.model_dump()
         except ValidationError:

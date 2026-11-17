@@ -5,15 +5,15 @@ from psycopg_pool import PoolTimeout
 
 from app.core.db import connection
 from app.repositories import jobs as jobs_repo
-from app.schemas.cards import CardDraft
+from app.schemas.cards import CardSeo, CardSource, ProductCard
 
 
 @pytest.fixture()
 def conn():
     """Соединение с живой БД; тест пропускается, если база недоступна."""
     try:
-        with connection() as c:
-            yield c
+        with connection() as db_connection:
+            yield db_connection
     except (psycopg.Error, PoolTimeout):
         pytest.skip("postgres недоступен (поднимите: make infra)")
 
@@ -54,12 +54,19 @@ def test_set_status_and_get_job(conn, job_ids):
     job_id, _ = jobs_repo.create_job(conn, {"supplier_text": "x"}, None)
     job_ids.append(job_id)
     jobs_repo.set_status(conn, job_id, "generating", bump_attempts=True)
-    draft = CardDraft(title="Чайник", description="Описание")
-    jobs_repo.set_status(conn, job_id, "approved", result=draft)
+    card = ProductCard(
+        title="Чайник",
+        description="Описание",
+        seo=CardSeo(slug="chainik"),
+        source=CardSource(document="supplier_text"),
+        confidence=0.9,
+    )
+    jobs_repo.set_status(conn, job_id, "approved", result=card)
     job = jobs_repo.get_job(conn, job_id)
     assert job["status"] == "approved"
     assert job["attempts"] == 1
     assert job["result"]["title"] == "Чайник"
+    assert job["result"]["confidence"] == 0.9
 
 
 def test_get_job_missing(conn):

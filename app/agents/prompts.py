@@ -6,7 +6,8 @@ strict JSON mode.
 from agents import Agent, AgentOutputSchema, ModelSettings
 
 from app.core.config import settings
-from app.schemas.cards import CardDraft, CritiqueReport, SupplierFacts
+from app.schemas.cards import CritiqueReport, ProductCard, SupplierFacts
+from app.services.structured import schema_instructions
 
 _MODEL = settings.llm_model
 
@@ -32,21 +33,23 @@ extractor_agent = Agent(
     output_type=AgentOutputSchema(SupplierFacts, strict_json_schema=False),
 )
 
-generator_agent = Agent(
-    name="Generator",
+card_agent = Agent(
+    name="CardGenerator",
     instructions=(
-        "Ты — копирайтер маркетплейса. Из фактов о товаре сделай черновик карточки.\n"
-        "Верни СТРОГО JSON с этими полями и никаких других:\n"
-        "- title (string): заголовок до 60 символов\n"
-        "- description (string): описание на 3-4 предложения, продающее, без воды\n"
-        "- characteristics (object): характеристики ключ-значение\n"
-        "- benefits (array of string): 3-5 преимуществ\n"
-        "Используй только предоставленные факты. Если есть замечания критика "
-        "(feedback) — учти их. Никакого markdown, только валидный JSON."
+        "Ты — копирайтер маркетплейса. Из фактов о товаре сделай карточку.\n"
+        "Правила:\n"
+        "- используй только предоставленные факты, ничего не выдумывай;\n"
+        "- каких-то данных нет — положи имя поля в missing_fields "
+        "и снизь confidence; НЕ додумывай значения;\n"
+        "- confidence — уверенность от 0 до 1: скудный исходный текст — "
+        "низкая уверенность, полные факты — высокая;\n"
+        "- в source.document укажи имя источника, переданное в запросе;\n"
+        "- заголовок не длиннее 60 символов.\n"
+        + schema_instructions(ProductCard)
     ),
     model=_MODEL,
     model_settings=_MODEL_SETTINGS,
-    output_type=AgentOutputSchema(CardDraft, strict_json_schema=False),
+    output_type=AgentOutputSchema(ProductCard, strict_json_schema=False),
 )
 
 critic_agent = Agent(

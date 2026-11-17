@@ -50,7 +50,7 @@ async def create_job(
         client = await get_client()
         await client.start_workflow(
             "CardWorkflow",
-            args=[body.supplier_text, job_id],
+            args=[body.supplier_text, job_id, 3, settings.card_confidence_threshold],
             id=f"card-{job_id}",
             task_queue=settings.temporal_task_queue,
         )

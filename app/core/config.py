@@ -15,6 +15,9 @@ class Settings(BaseSettings):
 
     llm_timeout_s: float = 120.0
     llm_max_retries: int = 3
+    
+    validation_max_attempts: int = 2
+    card_confidence_threshold: float = 0.6
 
 
 settings = Settings()

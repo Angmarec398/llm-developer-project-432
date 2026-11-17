@@ -10,7 +10,7 @@ from temporalio import activity
 
 from app.core.db import connection
 from app.repositories import jobs as jobs_repo
-from app.schemas.cards import CardDraft, SupplierFacts
+from app.schemas.cards import ProductCard, SupplierFacts
 from app.services import pipeline
 
 
@@ -23,7 +23,7 @@ def set_status_activity(
     bump_attempts: bool = False,
 ) -> None:
     """Записать статус задачи в БД через репозиторий (отдельный шаг процесса)."""
-    result = CardDraft.model_validate_json(result_json) if result_json else None
+    result = ProductCard.model_validate_json(result_json) if result_json else None
     with connection() as conn:
         jobs_repo.set_status(
             conn, job_id, status,
@@ -33,18 +33,18 @@ def set_status_activity(
 
 @activity.defn
 async def generate_activity(facts_json: str, feedback_json: str | None = None) -> str:
-    """Сгенерировать черновик карточки по фактам (шаг generate)."""
+    """Сгенерировать карточку по фактам (шаг generate, контракт шага 4)."""
     facts = SupplierFacts.model_validate_json(facts_json)
     feedback = json.loads(feedback_json) if feedback_json else None
-    draft = await pipeline.generate(facts, feedback)
-    return draft.model_dump_json()
+    card = await pipeline.generate_card(facts, feedback)
+    return card.model_dump_json()
 
 
 @activity.defn
 async def critique_activity(facts_json: str, draft_json: str) -> str:
     """Проверить черновик по правилам и вернуть вердикт (шаг critique)."""
     facts = SupplierFacts.model_validate_json(facts_json)
-    draft = CardDraft.model_validate_json(draft_json)
+    draft = ProductCard.model_validate_json(draft_json)
     report = await pipeline.critique(facts, draft)
     return report.model_dump_json()
 

@@ -1,10 +1,10 @@
-"""CardWorkflow: extract → (generate → critique)* → сигнал оператора → финал.
+"""CardWorkflow: extract → (generate → critique)* → done или сигнал оператора.
 
 Правила детерминизма workflow-кода:
 - никаких datetime.now / random / HTTP / чтения конфига — только логика;
 - все side-effects — в activities (app/temporal/activities.py);
-- таймауты и лимиты — константы модуля, не settings (конфиг меняется
-  между реплеями и ломает воспроизведение истории).
+- таймауты и лимиты — константы модуля или аргументы workflow, не settings
+  (конфиг меняется между реплеями и ломает воспроизведение истории).
 
 Статус задачи пишется в БД отдельным шагом процесса (set_status_activity),
 а не изнутри стадий пайплайна. Повтор шага настроен явно (ACTIVITY_RETRY):
@@ -21,7 +21,7 @@ from temporalio import workflow
 from temporalio.common import RetryPolicy
 
 with workflow.unsafe.imports_passed_through():
-    from app.schemas.cards import CritiqueReport
+    from app.schemas.cards import CritiqueReport, ProductCard
     from app.temporal.activities import (
         critique_activity,
         extract_activity,
@@ -40,21 +40,30 @@ ACTIVITY_RETRY = RetryPolicy(
 
 @workflow.defn
 class CardWorkflow:
-    """Устойчивый процесс генерации карточки с ожиданием решения оператора."""
+    """Устойчивый процесс генерации карточки с порогом уверенности."""
 
     def __init__(self) -> None:
         self._status = "starting"
         self._human_decision: str | None = None
 
     @workflow.run
-    async def run(self, supplier_text: str, job_id: str, max_attempts: int = 3) -> str:
-        """Прогнать пайплайн и дождаться решения оператора.
+    async def run(
+        self,
+        supplier_text: str,
+        job_id: str,
+        max_attempts: int = 3,
+        confidence_threshold: float = 0.6,
+    ) -> str:
+        """Прогнать пайплайн и, если уверенность низкая, дождаться оператора.
 
         Статусная машина (зеркалит таблицу jobs):
         extracting → generating → critiquing → (regenerating)*
-        → awaiting_confirmation → approved | rejected; при сбое — failed.
+        → done | awaiting_confirmation → approved | rejected;
+        при сбое — failed.
 
-        Возвращает JSON итогового черновика карточки.
+        Порог уверенности приходит аргументом (из настроек приложения):
+        workflow не читает конфиг — значение фиксируется в истории.
+        Возвращает JSON итоговой карточки.
         """
         try:
             self._status = "extracting"
@@ -69,6 +78,7 @@ class CardWorkflow:
             feedback: list[str] = []
             attempts = 0
             draft_json = "{}"
+            approved = False
             while attempts < max_attempts:
                 attempts += 1
                 self._status = f"generating (attempt {attempts})"
@@ -93,13 +103,22 @@ class CardWorkflow:
                     )
                 )
                 if report.verdict == "approve":
+                    approved = True
                     break
                 feedback = report.issues
                 if attempts < max_attempts:
                     await self._set_status(job_id, "regenerating")
 
+            card = ProductCard.model_validate_json(draft_json)
+            if approved and card.confidence >= confidence_threshold:
+                self._status = "done"
+                await self._set_status(job_id, "done", result_json=draft_json)
+                return draft_json
+
             self._status = "awaiting human decision"
-            await self._set_status(job_id, "awaiting_confirmation")
+            await self._set_status(
+                job_id, "awaiting_confirmation", result_json=draft_json
+            )
             await workflow.wait_condition(lambda: self._human_decision is not None)
 
             if self._human_decision == "approve":
