@@ -15,9 +15,16 @@ class Settings(BaseSettings):
 
     llm_timeout_s: float = 120.0
     llm_max_retries: int = 3
-    
+
     validation_max_attempts: int = 2
     card_confidence_threshold: float = 0.6
+
+    upload_dir: str = "data/uploads"
+    upload_max_bytes: int = 10 * 1024 * 1024
+    upload_allowed_extensions: frozenset[str] = frozenset({".pdf", ".docx", ".xlsx"})
+
+    chunk_size: int = 800
+    chunk_overlap: int = 150
 
 
 settings = Settings()

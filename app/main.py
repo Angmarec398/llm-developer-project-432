@@ -5,7 +5,7 @@ from fastapi import FastAPI
 from app.core.db import close_pool, init_pool
 from app.core.logging import setup_logging
 from app.llm.client import setup_llm
-from app.routers import cards, health, jobs
+from app.routers import cards, documents, health, jobs
 
 
 @asynccontextmanager
@@ -20,4 +20,5 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="card-pipeline", lifespan=lifespan)
 app.include_router(cards.router)
 app.include_router(jobs.router)
+app.include_router(documents.router)
 app.include_router(health.router)

@@ -1,5 +1,7 @@
 """CardWorkflow: extract → (generate → critique)* → done или сигнал оператора.
 
+DocumentWorkflow: разбор загруженного документа в фрагменты (шаг 5).
+
 Правила детерминизма workflow-кода:
 - никаких datetime.now / random / HTTP / чтения конфига — только логика;
 - все side-effects — в activities (app/temporal/activities.py);
@@ -26,6 +28,7 @@ with workflow.unsafe.imports_passed_through():
         critique_activity,
         extract_activity,
         generate_activity,
+        parse_document_activity,
         set_status_activity,
     )
 
@@ -36,6 +39,28 @@ ACTIVITY_RETRY = RetryPolicy(
     backoff_coefficient=2.0,
     maximum_attempts=3,
 )
+
+
+@workflow.defn
+class DocumentWorkflow:
+    """Устойчивый процесс разбора документа: один блокирующий шаг.
+
+    Статусы документа (parsing → indexed | failed) пишет сам сервис
+    разбора внутри шага — документ не задача генерации, отдельная
+    status-activity ему не нужна. workflow_id детерминированный:
+    document-<document_id>, повторный старт с тем же id движок
+    не выполнит.
+    """
+
+    @workflow.run
+    async def run(self, document_id: str, file_path: str) -> int:
+        """Запустить шаг разбора и вернуть число сохранённых фрагментов."""
+        return await workflow.execute_activity(
+            parse_document_activity,
+            args=[document_id, file_path],
+            start_to_close_timeout=ACTIVITY_TIMEOUT,
+            retry_policy=ACTIVITY_RETRY,
+        )
 
 
 @workflow.defn

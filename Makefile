@@ -1,12 +1,13 @@
-.PHONY: help infra api worker temporal temporal-show temporal-worker
+.PHONY: help infra api worker migrate lint temporal temporal-show temporal-worker
 
 help:
-	@echo "make infra           - поднять postgres + rabbitmq (docker compose)"
+	@echo "make infra           - поднять postgres (docker compose)"
 	@echo "make temporal        - добавить temporal server (:7233) + UI (:8233) + CLI"
 	@echo "make temporal-show ID=card-abc123 - история workflow (temporal CLI из docker)"
 	@echo "make api             - FastAPI на :8000"
-	@echo "make worker          - celery-воркер (очереди card.generate + card.critique)"
-	@echo "make temporal-worker - temporal-воркер (workflow + activities)"
+	@echo "make worker          - temporal-воркер (workflow + activities)"
+	@echo "make migrate         - применить миграции БД"
+	@echo "make lint            - ruff check app tests"
 
 infra:
 	docker compose up -d
@@ -19,6 +20,9 @@ temporal-show:
 
 api:
 	uvicorn app.main:app --reload --port 8000
+
+worker:
+	python -m app.temporal_worker
 
 temporal-worker:
 	python -m app.temporal_worker

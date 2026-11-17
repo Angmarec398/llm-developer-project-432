@@ -12,6 +12,7 @@ from app.core.db import connection
 from app.repositories import jobs as jobs_repo
 from app.schemas.cards import ProductCard, SupplierFacts
 from app.services import pipeline
+from app.services.documents import process_document
 
 
 @activity.defn
@@ -48,8 +49,21 @@ async def critique_activity(facts_json: str, draft_json: str) -> str:
     report = await pipeline.critique(facts, draft)
     return report.model_dump_json()
 
+
 @activity.defn
 async def extract_activity(supplier_text: str) -> str:
     """Извлечь структурированные факты из текста поставщика (шаг extract)."""
     facts = await pipeline.extract(supplier_text)
     return facts.model_dump_json()
+
+
+@activity.defn
+def parse_document_activity(document_id: str, file_path: str) -> int:
+    """Разобрать документ в фрагменты (шаг процесса DocumentWorkflow).
+
+    Синхронная и блокирующая (диск + база): выполняется в потоке
+    пула activity_executor, как и любой шаг с базой или диском.
+    Ошибки разбора не летят наружу — сервис превращает их в отказ
+    документа с причиной и возвращает 0.
+    """
+    return process_document(document_id, file_path)
