@@ -96,7 +96,7 @@ class _FakeTemporalClient:
     def __init__(self) -> None:
         self.started: list[dict] = []
 
-    async def start_workflow(self, workflow, args, id, task_queue):  # noqa: A002
+    async def start_workflow(self, workflow, args, id, task_queue):
         """Записать параметры запуска процесса вместо обращения к движку."""
         self.started.append(
             {"workflow": workflow, "args": args, "id": id, "task_queue": task_queue}

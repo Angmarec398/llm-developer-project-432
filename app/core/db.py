@@ -3,11 +3,16 @@
 Пул — ресурс уровня приложения: создаётся один раз на процесс
 и живёт столько же, сколько процесс. Соединение — ресурс уровня
 операции: берут из пула на короткую работу и возвращают.
+
+Адаптер pgvector регистрируется на каждом новом соединении
+(параметр configure пула): без него psycopg не примет Python-список
+чисел как значение колонки vector.
 """
 from collections.abc import Iterator
 from contextlib import contextmanager
 
 import psycopg
+from pgvector.psycopg import register_vector
 from psycopg_pool import ConnectionPool
 
 from app.core.config import settings
@@ -19,7 +24,12 @@ def init_pool() -> None:
     """Создаёт пул соединений. Вызывается один раз на старте процесса."""
     global _pool
     if _pool is None:
-        _pool = ConnectionPool(settings.database_url, open=True, kwargs={"autocommit": True})
+        _pool = ConnectionPool(
+            settings.database_url,
+            open=True,
+            kwargs={"autocommit": True},
+            configure=register_vector,
+        )
 
 
 def close_pool() -> None:

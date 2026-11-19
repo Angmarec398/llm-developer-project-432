@@ -26,5 +26,12 @@ class Settings(BaseSettings):
     chunk_size: int = 800
     chunk_overlap: int = 150
 
+    embedding_model: str = "intfloat/multilingual-e5-small"
+    embedding_dimension: int = 384
+    embedding_batch_size: int = 32
+
+    retrieval_top_k: int = 5
+    retrieval_score_threshold: float = 0.80
+
 
 settings = Settings()
