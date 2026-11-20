@@ -8,10 +8,13 @@ from app.core.config import settings
 from app.core.logging import get_logger, setup_logging
 from app.temporal.activities import (
     critique_activity,
-    extract_activity,
+    embed_documents_activity,
     generate_activity,
     parse_document_activity,
+    parse_documents_activity,
+    search_context_activity,
     set_status_activity,
+    verify_citations_activity,
 )
 from app.temporal.client import get_client
 from app.temporal.workflows import CardWorkflow, DocumentWorkflow
@@ -28,8 +31,11 @@ async def main():
         task_queue=settings.temporal_task_queue,
         workflows=[CardWorkflow, DocumentWorkflow],
         activities=[
-            extract_activity,
+            parse_documents_activity,
+            embed_documents_activity,
+            search_context_activity,
             generate_activity,
+            verify_citations_activity,
             critique_activity,
             set_status_activity,
             parse_document_activity,

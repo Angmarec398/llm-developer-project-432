@@ -33,5 +33,7 @@ class Settings(BaseSettings):
     retrieval_top_k: int = 5
     retrieval_score_threshold: float = 0.80
 
+    context_max_chars: int = 6000
+
 
 settings = Settings()

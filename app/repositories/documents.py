@@ -3,6 +3,10 @@
 Единственный владелец SQL для документов поставщиков.
 Статусная машина: new → parsing → indexed | failed
 (failed сопровождается причиной в поле error).
+
+Шаг 7: get_document отдаёт ещё и file_path — оркестрации карточки
+нужен путь, чтобы доразобрать документ, загруженный, но ещё не
+проиндексированный.
 """
 import uuid
 from datetime import UTC, datetime
@@ -46,11 +50,15 @@ def create_document(
 
 
 def get_document(conn: psycopg.Connection, document_id: str) -> dict | None:
-    """Вернуть документ со счётчиком фрагментов (None, если документа нет)."""
+    """Вернуть документ с путём, статусом и счётчиком фрагментов.
+
+    None, если документа нет. file_path нужен оркестрации карточки
+    для доразбора непроиндексированного документа.
+    """
     with conn.cursor() as cur:
         cur.execute(
             """
-            SELECT d.id, d.filename, d.status, d.error,
+            SELECT d.id, d.filename, d.file_path, d.status, d.error,
                    (SELECT count(*) FROM chunks c WHERE c.document_id = d.id)
                        AS chunks_count
             FROM documents d
@@ -64,9 +72,10 @@ def get_document(conn: psycopg.Connection, document_id: str) -> dict | None:
     return {
         "id": row[0],
         "filename": row[1],
-        "status": row[2],
-        "error": row[3],
-        "chunks_count": row[4],
+        "file_path": row[2],
+        "status": row[3],
+        "error": row[4],
+        "chunks_count": row[5],
     }
 
 

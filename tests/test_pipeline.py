@@ -1,94 +1,65 @@
-"""Тесты пайплайна: клиент модели подменён, сеть и LLM не нужны."""
+"""Тесты стадий пайплайна: генерация от контекста, критик сверяет с источниками.
+
+Клиент модели подменён, сеть и LLM не нужны. Цикл перегенерации
+тестируется на уровне оркестрации в сквозном тесте (tests/test_end_to_end.py).
+"""
 import pytest
 
-from app.schemas.cards import (
-    CardSeo,
-    CardSource,
-    CritiqueReport,
-    ProductCard,
-    SupplierFacts,
-)
+from app.schemas.cards import CardSeo, CardSource, CritiqueReport, ProductCard
 from app.services import pipeline, structured
 
-FACTS = SupplierFacts(
-    product_name="Чайник", characteristics={"мощность": "2200 Вт"}
-)
+CONTEXT = "[1] документ doc-1, фрагмент 1, id 7\nМощность 2200 Вт"
 CARD = ProductCard(
     title="Чайник 2200 Вт",
     description="Описание",
     characteristics={"мощность": "2200 Вт"},
     benefits=["Быстрый"],
     seo=CardSeo(slug="chainik-2200"),
-    source=CardSource(document="supplier_text"),
+    sources=[CardSource(chunk_id=7, document="doc-1")],
     confidence=0.9,
 )
 
 
-def _mock_run_agent(monkeypatch: pytest.MonkeyPatch, outputs: list) -> None:
-    """Подменить run_agent очередью заготовленных ответов модели.
+def _mock_run_agent(monkeypatch: pytest.MonkeyPatch, outputs: list) -> list[str]:
+    """Подменить run_agent очередью ответов; вернуть список промптов.
 
-    Патчится в пространстве имён structured: все стадии пайплайна
-    зовут run_agent через call_validated.
+    Патчится в пространстве имён structured: обе стадии зовут
+    run_agent через call_validated.
     """
+    prompts: list[str] = []
     answers = iter(outputs)
 
     async def fake_run_agent(agent, prompt):
+        prompts.append(prompt)
         return next(answers)
 
     monkeypatch.setattr(structured, "run_agent", fake_run_agent)
+    return prompts
 
 
-
-async def test_pipeline_approved_first_try(monkeypatch: pytest.MonkeyPatch):
-    """Успех: критик одобряет первую карточку — один круг, verdict approved."""
-    _mock_run_agent(monkeypatch, [FACTS, CARD, CritiqueReport(verdict="approve")])
-    card, attempts, verdict = await pipeline.run_pipeline("текст поставщика")
-    assert verdict == "approved"
-    assert attempts == 1
+async def test_generate_sends_context_to_model(monkeypatch: pytest.MonkeyPatch):
+    """Генерация: промпт содержит контекст с опознаваемым фрагментом."""
+    prompts = _mock_run_agent(monkeypatch, [CARD])
+    card = await pipeline.generate_card(CONTEXT)
     assert card == CARD
+    assert CONTEXT in prompts[0]
+    assert "id 7" in prompts[0]
 
 
-async def test_pipeline_approved_after_rework(monkeypatch: pytest.MonkeyPatch):
-    """Переделка: первая карточка отклонена, исправленная одобрена."""
-    improved = CARD.model_copy(update={"title": "Чайник стальной 2200 Вт"})
-    _mock_run_agent(monkeypatch, [
-        FACTS,
-        CARD,
-        CritiqueReport(verdict="regenerate", issues=["заголовок длинный"]),
-        improved,
-        CritiqueReport(verdict="approve"),
-    ])
-    card, attempts, verdict = await pipeline.run_pipeline("текст поставщика")
-    assert verdict == "approved"
-    assert attempts == 2
-    assert card.title == "Чайник стальной 2200 Вт"
+async def test_generate_includes_feedback(monkeypatch: pytest.MonkeyPatch):
+    """Переделка: замечания (нарушения ссылок, критик) уходят в промпт."""
+    prompts = _mock_run_agent(monkeypatch, [CARD])
+    await pipeline.generate_card(
+        CONTEXT, feedback=["фрагмент 99 не существует в базе"]
+    )
+    assert "Замечания к переделке" in prompts[0]
+    assert "фрагмент 99 не существует в базе" in prompts[0]
 
 
-async def test_pipeline_loop_exhausted(monkeypatch: pytest.MonkeyPatch):
-    """Петля исчерпана: критик всегда против — стоп после трёх кругов."""
-    _mock_run_agent(monkeypatch, [
-        FACTS,
-        CARD, CritiqueReport(verdict="regenerate", issues=["плохо"]),
-        CARD, CritiqueReport(verdict="regenerate", issues=["всё ещё плохо"]),
-        CARD, CritiqueReport(verdict="regenerate", issues=["нет"]),
-    ])
-    _card, attempts, verdict = await pipeline.run_pipeline("текст поставщика")
-    assert verdict == "rejected"
-    assert attempts == 3
-
-
-async def test_pipeline_low_confidence_goes_to_human(
-    monkeypatch: pytest.MonkeyPatch,
-):
-    """Критик доволен, но уверенность ниже порога — не «готово», а человек."""
-    scarce_card = CARD.model_copy(update={
-        "confidence": 0.3,
-        "missing_fields": ["гарантия", "цвет"],
-    })
-    _mock_run_agent(monkeypatch, [
-        FACTS, scarce_card, CritiqueReport(verdict="approve"),
-    ])
-    card, _attempts, verdict = await pipeline.run_pipeline("скудный текст")
-    assert verdict == "low_confidence"
-    assert card.missing_fields  # непустой список недостающих полей
-    assert card.confidence < 0.6
+async def test_critique_gets_context_and_card(monkeypatch: pytest.MonkeyPatch):
+    """Критик получает и контекст, и карточку: сверяет утверждения с источниками."""
+    prompts = _mock_run_agent(monkeypatch, [CritiqueReport(verdict="approve")])
+    report = await pipeline.critique(CONTEXT, CARD)
+    assert report.verdict == "approve"
+    assert CONTEXT in prompts[0]
+    assert "Чайник 2200 Вт" in prompts[0]

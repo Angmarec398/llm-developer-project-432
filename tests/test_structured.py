@@ -11,7 +11,7 @@ VALID_CARD_JSON = ProductCard(
     title="Чайник",
     description="Описание",
     seo=CardSeo(slug="chainik"),
-    source=CardSource(document="kettle_spec.xlsx"),
+    sources=[CardSource(chunk_id=1, document="kettle_spec.xlsx")],
     confidence=0.9,
 ).model_dump_json()
 
@@ -81,7 +81,7 @@ async def test_repair_field_fixes_only_title(monkeypatch):
         title="Чайник",
         description="Нержавеющая сталь, 2200 Вт, объём 1.7 литра.",
         seo=CardSeo(slug="chainik"),
-        source=CardSource(document="kettle_spec.xlsx"),
+        sources=[CardSource(chunk_id=1, document="kettle_spec.xlsx")],
         confidence=0.9,
     )
     broken = card.model_copy(update={"title": "x" * 61})  # мимо валидаторов

@@ -58,7 +58,7 @@ def test_set_status_and_get_job(conn, job_ids):
         title="Чайник",
         description="Описание",
         seo=CardSeo(slug="chainik"),
-        source=CardSource(document="supplier_text"),
+        sources=[CardSource(chunk_id=1, document="supplier_text")],
         confidence=0.9,
     )
     jobs_repo.set_status(conn, job_id, "approved", result=card)

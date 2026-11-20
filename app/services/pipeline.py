@@ -1,83 +1,48 @@
-"""Стадии пайплайна: extract → generate → critique.
+"""Стадии пайплайна шага 7: generate → critique, генерация от контекста.
 
-Каждая функция — один агент-шаг. Один и тот же код работает в трёх runtime:
-- FastAPI-эндпоинт (шаг 1 практики),
-- Celery-воркер (шаги 2-3),
-- Temporal activity (шаг 4).
-Это и есть выигрыш слоистой архитектуры.
+Контекст — найденные фрагменты документов (app/rag), а не целый текст
+поставщика: extractor-стадия больше не нужна, её работу делает поиск.
+Модель обязана вернуть источники (фрагменты с id); проверка ссылок —
+детерминированный код (app/services/citations.py), критик сверяет
+утверждения с источниками.
+
+Стадии мелкие и самостоятельные — цикл перегенерации живёт в
+оркестрации (app/services/cards.py), чтобы один и тот же код работал
+в двух runtime: FastAPI-эндпоинте (POST /cards) и Temporal activity.
 """
-from app.agents.prompts import card_agent, critic_agent, extractor_agent
-from app.core.config import settings
+from app.agents.prompts import card_agent, critic_agent
 from app.core.logging import get_logger
-from app.schemas.cards import CritiqueReport, ProductCard, SupplierFacts
+from app.schemas.cards import CritiqueReport, ProductCard
 from app.services.structured import call_validated
 
 log = get_logger(__name__)
 
 
-async def extract(supplier_text: str) -> SupplierFacts:
-    """Извлечь факты из текста поставщика (с лечением ответа)."""
-    log.info("step_extract_start")
-    return await call_validated(extractor_agent, supplier_text, SupplierFacts)
-
-
 async def generate_card(
-    facts: SupplierFacts,
-    feedback: list[str] | None = None,
-    source_name: str = "supplier_text",
+    context: str, feedback: list[str] | None = None
 ) -> ProductCard:
-    """Сгенерировать карточку по контракту шага 4 (с лечением ответа)."""
-    prompt = (
-        "Факты о товаре:\n"
-        + facts.model_dump_json(indent=2)
-        + f"\nИсточник: {source_name}"
-    )
+    """Сгенерировать карточку от контекста фрагментов (с лечением ответа).
+
+    feedback — замечания к переделке (нарушения ссылок или список
+    проблем критика): уходят в промпт, чтобы модель исправила именно
+    их, а не переписала карточку с нуля.
+    """
+    prompt = "Контекст — фрагменты документов поставщика:\n" + context
     if feedback:
-        prompt += "\n\nЗамечания критика, учти:\n" + "\n".join(
+        prompt += "\n\nЗамечания к переделке, учти каждое:\n" + "\n".join(
             f"- {issue}" for issue in feedback
         )
     log.info("step_generate_start", feedback=bool(feedback))
     return await call_validated(card_agent, prompt, ProductCard)
 
 
-async def critique(facts: SupplierFacts, card: ProductCard) -> CritiqueReport:
-    """Проверить карточку по правилам (с лечением ответа)."""
+async def critique(context: str, card: ProductCard) -> CritiqueReport:
+    """Проверить карточку: критик сверяет утверждения с источниками."""
     prompt = (
-        "Факты о товаре:\n"
-        + facts.model_dump_json(indent=2)
+        "Контекст — фрагменты документов поставщика:\n"
+        + context
         + "\n\nКарточка для проверки:\n"
         + card.model_dump_json(indent=2)
     )
     log.info("step_critique_start")
     return await call_validated(critic_agent, prompt, CritiqueReport)
-
-
-async def run_pipeline(supplier_text: str, max_attempts: int = 3):
-    """Полный цикл: extract → (generate → critique → feedback)* → итог.
-
-    Возвращает (карточку, число генераций, вердикт).
-    Вердикт: approved — критик доволен и уверенность выше порога;
-    low_confidence — критик доволен, но уверенность ниже порога,
-    карточку должен посмотреть человек; rejected — петля исчерпана.
-    """
-    facts = await extract(supplier_text)
-    feedback: list[str] = []
-    attempts = 0
-    card = None
-    verdict = "rejected"
-    while attempts < max_attempts:
-        attempts += 1
-        card = await generate_card(facts, feedback or None)
-        report = await critique(facts, card)
-        if report.verdict == "approve":
-            verdict = "approved"
-            break
-        feedback = report.issues
-        log.info("pipeline_regenerate", attempt=attempts, issues=report.issues)
-    if (
-        verdict == "approved"
-        and card.confidence < settings.card_confidence_threshold
-    ):
-        verdict = "low_confidence"
-        log.info("pipeline_low_confidence", confidence=card.confidence)
-    return card, attempts, verdict
