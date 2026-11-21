@@ -13,6 +13,10 @@ DocumentWorkflow: разбор загруженного документа в ф
 упавший шаг повторяется движком, убитый воркер подхватывает процесс
 с последнего завершённого шага.
 
+Трассировка (шаг 8): job_id уходит в LLM-activities аргументом — воркер
+привязывает его к контексту логов, вызовы модели пишутся в таблицу
+учёта с этим job_id; один поиск по id показывает весь путь задачи.
+
 Песочница воркфлоу запрещает тяжёлые импорты, поэтому app.schemas
 и activities проходят через workflow.unsafe.imports_passed_through().
 """
@@ -35,7 +39,7 @@ with workflow.unsafe.imports_passed_through():
         verify_citations_activity,
     )
 
-ACTIVITY_TIMEOUT = timedelta(seconds=300)
+ACTIVITY_TIMEOUT = timedelta(seconds=600)
 STATUS_TIMEOUT = timedelta(seconds=30)
 ACTIVITY_RETRY = RetryPolicy(
     initial_interval=timedelta(seconds=1),
@@ -99,7 +103,7 @@ class CardWorkflow:
         Не одобрено критиком или уверенность ниже порога — тоже
         ожидание человека. Порог приходит аргументом (из настроек
         приложения): workflow не читает конфиг — значение фиксируется
-        в истории.
+        в истории. job_id уходит в LLM-activities для учёта и логов.
         """
         try:
             self._status = "parsing"
@@ -152,6 +156,7 @@ class CardWorkflow:
                 draft_json = await workflow.execute_activity(
                     generate_activity,
                     args=[
+                        job_id,
                         context,
                         json.dumps(feedback, ensure_ascii=False)
                         if feedback else None,
@@ -189,7 +194,7 @@ class CardWorkflow:
                 report = CritiqueReport.model_validate_json(
                     await workflow.execute_activity(
                         critique_activity,
-                        args=[context, draft_json],
+                        args=[job_id, context, draft_json],
                         start_to_close_timeout=ACTIVITY_TIMEOUT,
                         retry_policy=ACTIVITY_RETRY,
                     )

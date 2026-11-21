@@ -8,11 +8,18 @@ LLM-клиент, ходить в сеть и базу. Данные перед�
 (app/services/cards.py): так сквозной сценарий одинаков в синхронном
 эндпоинте POST /cards и в устойчивом процессе CardWorkflow, а шаги
 процесса видны в его истории.
+
+Учёт и трассировка (шаг 8): LLM-activities принимают job_id первым
+аргументом и привязывают его к contextvars — вызовы модели внутри
+попадают в таблицу llm_calls с этим job_id, а логи шага можно найти
+одним поиском.
 """
 import json
 
+import structlog
 from temporalio import activity
 
+from app.core.context import bind_job
 from app.core.db import connection
 from app.repositories import jobs as jobs_repo
 from app.schemas.cards import ProductCard
@@ -86,10 +93,18 @@ def search_context_activity(document_ids_json: str, hint: str | None) -> str:
 
 
 @activity.defn
-async def generate_activity(context: str, feedback_json: str | None = None) -> str:
-    """Сгенерировать карточку от контекста фрагментов (шаг generating)."""
+async def generate_activity(
+    job_id: str, context: str, feedback_json: str | None = None
+) -> str:
+    """Сгенерировать карточку от контекста фрагментов (шаг generating).
+
+    job_id привязывается к контексту на время шага: вызовы модели внутри
+    уходят в таблицу учёта с этим job_id, логи шага находятся поиском.
+    """
     feedback = json.loads(feedback_json) if feedback_json else None
-    card = await pipeline.generate_card(context, feedback)
+    with bind_job(job_id):
+        structlog.contextvars.bind_contextvars(job_id=job_id)
+        card = await pipeline.generate_card(context, feedback)
     return card.model_dump_json()
 
 
@@ -108,10 +123,15 @@ def verify_citations_activity(draft_json: str, context_chunk_ids_json: str) -> s
 
 
 @activity.defn
-async def critique_activity(context: str, draft_json: str) -> str:
-    """Проверить черновик критиком (шаг critiquing): вердикт и проблемы."""
+async def critique_activity(job_id: str, context: str, draft_json: str) -> str:
+    """Проверить черновик критиком (шаг critiquing): вердикт и проблемы.
+
+    job_id привязывается к контексту на время шага (учёт и логи).
+    """
     draft = ProductCard.model_validate_json(draft_json)
-    report = await pipeline.critique(context, draft)
+    with bind_job(job_id):
+        structlog.contextvars.bind_contextvars(job_id=job_id)
+        report = await pipeline.critique(context, draft)
     return report.model_dump_json()
 
 

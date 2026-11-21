@@ -89,3 +89,22 @@ class ProductCard(BaseModel):
                 + ", ".join(sorted(both))
             )
         return self
+
+
+class FaithfulnessVerdict(BaseModel):
+    """Вердикт модели-судьи (шаг 8): какие утверждения карточки
+    подтверждаются фрагментами-источниками, а каких в них нет.
+
+    Судья только размечает; долю считает детерминированный код
+    (evals/metrics.py) — оценке модели доверяем как оценке,
+    а не как истине.
+    """
+
+    supported: list[str] = Field(
+        default_factory=list,
+        description="Утверждения карточки, прямо подтверждённые фрагментами",
+    )
+    unsupported: list[str] = Field(
+        default_factory=list,
+        description="Утверждения, которых во фрагментах нет",
+    )

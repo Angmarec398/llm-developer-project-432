@@ -10,6 +10,7 @@ import json
 import re
 from typing import TypeVar
 
+from agents.exceptions import ModelBehaviorError
 from pydantic import BaseModel, ValidationError
 
 from app.core.config import settings
@@ -61,9 +62,9 @@ def extract_json(raw_text: str) -> str:
 def schema_instructions(output_model: type[BaseModel]) -> str:
     """Текстовая копия JSON-схемы для инструкции агента.
 
-    SDK передаёт схему в запрос через output_type (response_format),
-    но LM Studio не поддерживает strict JSON mode, поэтому схема
-    дублируется текстом — иначе модель не знает форму ответа.
+    Схема в запрос не передаётся (output_type у агентов убран на шаге 8:
+    грамматика LM Studio обнуляет свободные dict) — модель видит форму
+    ответа только текстом, грязный JSON разбирает extract_json.
     """
     schema_json = json.dumps(
         output_model.model_json_schema(), ensure_ascii=False, indent=2
@@ -92,7 +93,23 @@ async def call_validated(
     current_prompt = prompt
     last_error: Exception | None = None
     for attempt in range(1, attempts_limit + 1):
-        raw_output = await run_agent(agent, current_prompt)
+        try:
+            raw_output = await run_agent(agent, current_prompt)
+        except ModelBehaviorError as sdk_error:
+            # SDK разбирает output_type сам и падает ДО нашего extract_json —
+            # для лечения это эквивалент невалидного ответа.
+            last_error = ResponseParseError(
+                f"модель вернула невалидный JSON ({sdk_error})"
+            )
+            log.info(
+                "validation_healing_retry",
+                attempt=attempt,
+                error=str(sdk_error)[:200],
+            )
+            current_prompt = _repair_prompt(
+                prompt, "<ответ не разобран SDK>", last_error
+            )
+            continue
         if isinstance(raw_output, output_model):
             return raw_output
         json_text = ""
@@ -144,7 +161,7 @@ async def _try_repair_field(
             agent, draft, field_name, str(error)
         )
         return repaired_card  # type: ignore[return-value]
-    except (ResponseParseError, ValidationError, json.JSONDecodeError) as repair_error:
+    except (ResponseParseError, ValidationError, json.JSONDecodeError, ModelBehaviorError) as repair_error:
         log.info(
             "field_repair_failed",
             field=field_name,

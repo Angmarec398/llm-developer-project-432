@@ -1,4 +1,4 @@
-"""Промпт как код: агенты кард-пайплайна — generator, critic.
+"""Промпт как код: агенты кард-пайплайна — generator, critic, judge.
 
 Схема дублируется текстом в промпте: LM Studio не поддерживает
 strict JSON mode.
@@ -10,43 +10,60 @@ strict JSON mode.
 источником. Сама проверка ссылок (фрагмент есть в базе и был в
 контексте) — не роль модели, а детерминированный код
 (app/services/citations.py).
+
+Шаг 8: output_type у агентов убран намеренно — SDK передаёт схему
+через response_format, и LM Studio гонит генерацию через грамматику,
+которая для свободного dict обнуляет содержимое (characteristics
+приходили пустыми, хотя свободная генерация заполняла их полностью).
+Разбор ответа — app/services/structured.py: схема текстом в промпте,
+грязный JSON вытаскивает extract_json, невалидный ответ лечится
+повторным вызовом с текстом ошибки.
 """
-from agents import Agent, AgentOutputSchema, ModelSettings
+from agents import Agent, ModelSettings
 
 from app.core.config import settings
-from app.schemas.cards import CritiqueReport, ProductCard
+from app.schemas.cards import ProductCard
 from app.services.structured import schema_instructions
 
 _MODEL = settings.llm_model
+# Служебная (дешёвая/слабая) модель для критика, судьи и починки полей —
+# политика двух моделей (шаг 8): служебные вызовы не требуют сильной.
+_MODEL_UTILITY = settings.llm_model_utility
 
 # Reasoning-модели (gemma-4 и т.п.) тратят токены на «размышления» до ответа:
 # без запаса max_tokens бюджет кончается раньше content, и LM Studio
 # обрывает stream по таймауту. 4096 хватает на размышления + JSON-ответ.
-_MODEL_SETTINGS = ModelSettings(max_tokens=4096, temperature=0.4)
+_MODEL_SETTINGS = ModelSettings(max_tokens=2048, temperature=0.4)
 
 card_agent = Agent(
     name="CardGenerator",
     instructions=(
         "Ты — копирайтер маркетплейса. Сделай карточку товара СТРОГО по "
-        "фрагментам контекста из запроса: каждый фрагмент снабжён строкой-"
-        "источником с id.\n"
+        "фрагментам контекста из запроса: каждый фрагмент начинается с "
+        "ярлыка «[id N]» и строки-источника.\n"
         "Правила:\n"
         "- используй только факты из контекста, ничего не выдумывай;\n"
-        "- каждое утверждение карточки опирается на фрагменты: перечисли их "
-        "в sources — chunk_id (число из «id N» строки-источника) и document "
-        "(название документа из той же строки);\n"
-        "- ссылаться можно ТОЛЬКО на фрагменты с id из контекста; ссылка на "
-        "фрагмент, которого в контексте не было, — грубая ошибка;\n"
-        "- каких-то данных нет в контексте — положи имя поля в missing_fields "
-        "и снизь confidence; НЕ додумывай значения;\n"
+        "- заполни characteristics не меньше чем 6–8 парами «название: "
+        "значение» (мощность, объём, материал, вес, гарантия, артикул "
+        "и т.п.); каждое значение — факт из контекста; пустой "
+        "characteristics — ошибка;\n"
+        "- каждое утверждение карточки опирается на фрагменты: перечисли "
+        "их в sources — chunk_id (число N из ярлыка «[id N]» фрагмента, "
+        "тот же id в строке-источнике) и document (название документа "
+        "из строки-источника);\n"
+        "- ссылаться можно ТОЛЬКО на фрагменты, чьи id есть в контексте; "
+        "ссылка на фрагмент, которого в контексте не было, — грубая "
+        "ошибка;\n"
+        "- каких-то данных нет в контексте — положи имя поля в "
+        "missing_fields и снизь confidence; НЕ додумывай значения;\n"
         "- confidence — уверенность от 0 до 1: скудный контекст — низкая "
-        "уверенность, полные факты — высокая; 1.0 недопустима, максимум 0.99;\n"
+        "уверенность, полные факты — высокая; 1.0 недопустима, максимум "
+        "0.99;\n"
         "- заголовок не длиннее 60 символов.\n"
         + schema_instructions(ProductCard)
     ),
     model=_MODEL,
     model_settings=_MODEL_SETTINGS,
-    output_type=AgentOutputSchema(ProductCard, strict_json_schema=False),
 )
 
 critic_agent = Agent(
@@ -69,7 +86,29 @@ critic_agent = Agent(
         "и фрагмента; при approve — пустой\n"
         "Никакого markdown, только валидный JSON."
     ),
-    model=_MODEL,
+    model=_MODEL_UTILITY,
     model_settings=_MODEL_SETTINGS,
-    output_type=AgentOutputSchema(CritiqueReport, strict_json_schema=False),
+)
+
+judge_agent = Agent(
+    name="Judge",
+    instructions=(
+        "Ты — ревизор фактов карточек маркетплейса. Разбей карточку на "
+        "отдельные проверяемые утверждения (каждая характеристика, "
+        "каждый конкретный факт из описания и преимуществ) и сверь "
+        "каждое с фрагментами контекста.\n"
+        "Правила:\n"
+        "- утверждение подтверждено, только если фрагмент прямо "
+        "содержит его содержание; близкая формулировка с добавлением "
+        "нового факта — не подтверждение;\n"
+        "- общие места без конкретики («высокое качество», «надёжность») "
+        "считай неподтверждёнными;\n"
+        "Верни СТРОГО JSON:\n"
+        '- supported (array of string): утверждения, подтверждённые фрагментами\n'
+        "- unsupported (array of string): утверждения, которых во "
+        "фрагментах нет\n"
+        "Никакого markdown, только валидный JSON."
+    ),
+    model=_MODEL_UTILITY,
+    model_settings=_MODEL_SETTINGS,
 )

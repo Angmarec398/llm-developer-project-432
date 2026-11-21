@@ -1,6 +1,7 @@
 """Точка входа Temporal-воркера: регистрирует workflows + activities."""
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
+from datetime import timedelta
 
 from temporalio.worker import Worker
 
@@ -20,6 +21,12 @@ from app.temporal.client import get_client
 from app.temporal.workflows import CardWorkflow, DocumentWorkflow
 
 log = get_logger(__name__)
+
+# Сколько воркер ждёт завершения уже выполняющихся активностей после
+# сигнала остановки, прежде чем отменить их. Пока идёт ожидание, воркер
+# не берёт новых задач. Значение закрывает самый долгий шаг: LLM-вызов
+# с повторами (llm_timeout_s=300) внутри активностей с лимитом 600 с.
+GRACEFUL_SHUTDOWN_TIMEOUT = timedelta(minutes=5)
 
 
 async def main():
@@ -41,10 +48,22 @@ async def main():
             parse_document_activity,
         ],
         activity_executor=ThreadPoolExecutor(max_workers=4),
+        graceful_shutdown_timeout=GRACEFUL_SHUTDOWN_TIMEOUT,
     )
     log.info("temporal_worker_started", task_queue=settings.temporal_task_queue)
-    await worker.run()
+    try:
+        await worker.run()
+    except asyncio.CancelledError:
+        # Ctrl+C: worker.run() уже дождался остановки поллеров и
+        # выполнившихся активностей — логируем чистый выход и гасим
+        # CancelledError, чтобы asyncio.run не печатал traceback.
+        log.info("temporal_worker_stopped")
+        raise
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        # Остановка по Ctrl+C — штатная операция, не ошибка.
+        pass

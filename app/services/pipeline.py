@@ -1,4 +1,4 @@
-"""Стадии пайплайна шага 7: generate → critique, генерация от контекста.
+"""Стадии пайплайна: generate → critique, генерация от контекста.
 
 Контекст — найденные фрагменты документов (app/rag), а не целый текст
 поставщика: extractor-стадия больше не нужна, её работу делает поиск.
@@ -6,13 +6,18 @@
 детерминированный код (app/services/citations.py), критик сверяет
 утверждения с источниками.
 
+Шаг 8: judge_faithfulness — третья метрика качества. Модель-судья
+(служебная, политика двух моделей) размечает утверждения карточки как
+подтверждённые/неподтверждённые фрагментами; долю считает
+детерминированный код (evals/metrics.py).
+
 Стадии мелкие и самостоятельные — цикл перегенерации живёт в
 оркестрации (app/services/cards.py), чтобы один и тот же код работал
 в двух runtime: FastAPI-эндпоинте (POST /cards) и Temporal activity.
 """
-from app.agents.prompts import card_agent, critic_agent
+from app.agents.prompts import card_agent, critic_agent, judge_agent
 from app.core.logging import get_logger
-from app.schemas.cards import CritiqueReport, ProductCard
+from app.schemas.cards import CritiqueReport, FaithfulnessVerdict, ProductCard
 from app.services.structured import call_validated
 
 log = get_logger(__name__)
@@ -46,3 +51,22 @@ async def critique(context: str, card: ProductCard) -> CritiqueReport:
     )
     log.info("step_critique_start")
     return await call_validated(critic_agent, prompt, CritiqueReport)
+
+
+async def judge_faithfulness(
+    context: str, card: ProductCard
+) -> FaithfulnessVerdict:
+    """Модель-судья: какие утверждения карточки подтверждаются фрагментами.
+
+    Вердикт — разметка, не число: долю подтверждённых считает
+    детерминированный код (evals/metrics.py). Судья — служебная
+    модель (политика двух моделей, шаг 8).
+    """
+    prompt = (
+        "Контекст — фрагменты документов поставщика:\n"
+        + context
+        + "\n\nКарточка для проверки:\n"
+        + card.model_dump_json(indent=2)
+    )
+    log.info("step_judge_start")
+    return await call_validated(judge_agent, prompt, FaithfulnessVerdict)

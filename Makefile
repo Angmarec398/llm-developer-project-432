@@ -1,4 +1,4 @@
-.PHONY: help infra api worker migrate lint temporal temporal-show temporal-worker
+.PHONY: help infra api worker migrate lint temporal temporal-show temporal-worker eval eval-full
 
 help:
 	@echo "make infra           - поднять postgres (docker compose)"
@@ -39,3 +39,9 @@ lint-fix:
 
 reindex:
 	python -m app.rag.reindex
+
+eval:
+	python -m evals
+
+eval-full:
+	python -m evals --full
