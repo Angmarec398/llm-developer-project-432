@@ -17,11 +17,12 @@ async def create_card(body: JobIn) -> ProductCard:
     """Сгенерировать карточку синхронно: документы → поиск → генерация.
 
     Проблемы с документами (не найдены, разобраны с ошибкой) — 422
-    с причиной, а не падение с 500.
+    с причиной, а не падение с 500. Отчёт защиты (шаг 9) в ответе
+    эндпоинта не нужен: возвращается только карточка.
     """
     try:
-        card, _attempts, _verdict = await cards_service.run_card_pipeline(
-            body.document_ids, body.hint
+        card, _attempts, _verdict, _report = (
+            await cards_service.run_card_pipeline(body.document_ids, body.hint)
         )
     except ValueError as error:
         raise HTTPException(422, str(error)) from error

@@ -10,10 +10,12 @@ from app.core.logging import get_logger, setup_logging
 from app.temporal.activities import (
     critique_activity,
     embed_documents_activity,
+    filter_output_activity,
     generate_activity,
     parse_document_activity,
     parse_documents_activity,
-    search_context_activity,
+    screen_context_activity,
+    search_chunks_activity,
     set_status_activity,
     verify_citations_activity,
 )
@@ -40,10 +42,12 @@ async def main():
         activities=[
             parse_documents_activity,
             embed_documents_activity,
-            search_context_activity,
+            search_chunks_activity,
+            screen_context_activity,
             generate_activity,
             verify_citations_activity,
             critique_activity,
+            filter_output_activity,
             set_status_activity,
             parse_document_activity,
         ],

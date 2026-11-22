@@ -16,6 +16,7 @@ from app.core.config import settings
 from app.core.db import connection
 from app.repositories import jobs as jobs_repo
 from app.schemas.cards import JobIn
+from app.schemas.jobs import JobOut
 from app.temporal.client import get_client
 
 router = APIRouter(tags=["jobs"])
@@ -71,7 +72,7 @@ async def create_job(
     return JSONResponse({"id": job_id, "status": "pending"}, status_code=202)
 
 
-@router.get("/jobs/{job_id}")
+@router.get("/jobs/{job_id}", response_model=JobOut)
 async def get_job(job_id: str):
     """Вернуть статус задачи и карточку со ссылками на источники."""
     with connection() as conn:

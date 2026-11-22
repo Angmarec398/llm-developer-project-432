@@ -21,8 +21,9 @@ from temporalio import activity
 
 from app.core.context import bind_job
 from app.core.db import connection
+from app.guardrails.output import filter_card_output
 from app.repositories import jobs as jobs_repo
-from app.schemas.cards import ProductCard
+from app.schemas.cards import GuardrailReport, ProductCard
 from app.services import cards as cards_service
 from app.services import pipeline
 from app.services.documents import process_document
@@ -35,14 +36,24 @@ def set_status_activity(
     result_json: str | None = None,
     error: str | None = None,
     bump_attempts: bool = False,
+    report_json: str | None = None,
 ) -> None:
-    """Записать статус задачи в БД через репозиторий (отдельный шаг процесса)."""
+    """Записать статус задачи в БД через репозиторий (отдельный шаг процесса).
+
+    report_json — отчёт защиты (шаг 9): пишется вместе с финальными
+    статусами, оператор видит, что замаскировано и что исключено.
+    """
     result = ProductCard.model_validate_json(
         result_json) if result_json else None
+    report = (
+        GuardrailReport.model_validate_json(
+            report_json) if report_json else None
+    )
     with connection() as conn:
         jobs_repo.set_status(
             conn, job_id, status,
             result=result, error=error, bump_attempts=bump_attempts,
+            guardrail_report=report,
         )
 
 
@@ -76,19 +87,50 @@ def embed_documents_activity(document_ids_json: str) -> int:
 
 
 @activity.defn
-def search_context_activity(document_ids_json: str, hint: str | None) -> str:
-    """Найти фрагменты и собрать контекст (шаг searching).
+def search_chunks_activity(document_ids_json: str, hint: str | None) -> str:
+    """Найти фрагменты и замаскировать ПДн (шаг searching, шаг 9).
 
-    Возвращает JSON {"context": str, "chunk_ids": [...]} — chunk_ids
-    это идентификаторы фрагментов, РЕАЛЬНО вошедших в контекст: по
-    этому списку проверяется, что ссылка карточки была в поданном
-    контексте, а не во всей выдаче поиска.
+    Маскирование — до того, как фрагменты покидают activity: в историю
+    процесса Temporal попадает только замаскированный текст. Возвращает
+    JSON {"chunks": [...], "report": {...}}; отчёт — только метки,
+    без сырых значений.
     """
-    context, chunk_ids = cards_service.build_search_context(
+    chunks, report = cards_service.search_chunks(
         json.loads(document_ids_json), hint
     )
     return json.dumps(
-        {"context": context, "chunk_ids": chunk_ids}, ensure_ascii=False
+        {"chunks": chunks, "report": report.model_dump()}, ensure_ascii=False
+    )
+
+
+@activity.defn
+async def screen_context_activity(job_id: str, found_json: str) -> str:
+    """Скрининг фрагментов детектором инъекций (шаг screening, шаг 9).
+
+    Подозрительные фрагменты выбрасываются из контекста; документ с
+    превышением порога подозрительных — целиком к человеку, тогда
+    blocked_reason не пуст, а контекст пустой. Возвращает JSON
+    {"context", "chunk_ids", "report", "blocked_reason"}. job_id
+    привязывается к контексту на время шага: вызовы служебной модели
+    детектора уходят в таблицу учёта с этим job_id, логи шага
+    находятся одним поиском.
+    """
+    found = json.loads(found_json)
+    report = GuardrailReport.model_validate(found["report"])
+    with bind_job(job_id):
+        structlog.contextvars.bind_contextvars(job_id=job_id)
+        screened, report, blocked_reason = await cards_service.screen_chunks(
+            found["chunks"], report
+        )
+    context, chunk_ids = cards_service.assemble_context(screened)
+    return json.dumps(
+        {
+            "context": context,
+            "chunk_ids": chunk_ids,
+            "report": report.model_dump(),
+            "blocked_reason": blocked_reason,
+        },
+        ensure_ascii=False,
     )
 
 
@@ -145,3 +187,25 @@ def parse_document_activity(document_id: str, file_path: str) -> int:
     документа с причиной и возвращает 0.
     """
     return process_document(document_id, file_path)
+
+
+@activity.defn
+def filter_output_activity(draft_json: str, report_json: str) -> str:
+    """Фильтр выхода (шаг 9): маскировать ПДн в карточке, найти следы инъекций.
+
+    Последний рубеж перед отдачей: карточка прогоняется теми же
+    детекторами, что фрагменты на входе. Возвращает JSON
+    {"card": <очищенный черновик>, "report": <отчёт>, "injection_traces":
+    [...]}; непустые traces — процесс уходит к человеку с причиной.
+    """
+    card = ProductCard.model_validate_json(draft_json)
+    report = GuardrailReport.model_validate_json(report_json)
+    cleaned, traces = filter_card_output(card, report)
+    return json.dumps(
+        {
+            "card": cleaned.model_dump(),
+            "report": report.model_dump(),
+            "injection_traces": traces,
+        },
+        ensure_ascii=False,
+    )

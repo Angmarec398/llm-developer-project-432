@@ -1,4 +1,4 @@
-"""CardWorkflow: документы → поиск → генерация → проверка → человек.
+"""CardWorkflow: документы → поиск → скрининг → генерация → проверка → человек.
 
 DocumentWorkflow: разбор загруженного документа в фрагменты (шаг 5).
 
@@ -17,6 +17,13 @@ DocumentWorkflow: разбор загруженного документа в ф
 привязывает его к контексту логов, вызовы модели пишутся в таблицу
 учёта с этим job_id; один поиск по id показывает весь путь задачи.
 
+Защита (шаг 9): фрагменты маскируются при поиске (searching), скрининг
+инъекций исключает подозрительные (screening), перед отдачей — фильтр
+выхода (filtering): контакты в карточке маскируются, следы служебных
+инструкций — к человеку. Отказали все документы — процесс сразу ждёт
+человека с причиной, генерации не было. Отчёт защиты пишется в колонку
+jobs.guardrail_report вместе с финальным статусом.
+
 Песочница воркфлоу запрещает тяжёлые импорты, поэтому app.schemas
 и activities проходят через workflow.unsafe.imports_passed_through().
 """
@@ -31,10 +38,12 @@ with workflow.unsafe.imports_passed_through():
     from app.temporal.activities import (
         critique_activity,
         embed_documents_activity,
+        filter_output_activity,
         generate_activity,
         parse_document_activity,
         parse_documents_activity,
-        search_context_activity,
+        screen_context_activity,
+        search_chunks_activity,
         set_status_activity,
         verify_citations_activity,
     )
@@ -75,9 +84,9 @@ class CardWorkflow:
     """Устойчивый процесс генерации карточки от контекста (шаг 7).
 
     Статусная машина (зеркалит таблицу jobs):
-    parsing → indexing → searching → generating → verifying → critiquing
-    → (regenerating)* → done | awaiting_confirmation → approved | rejected;
-    при сбое — failed.
+    parsing → indexing → searching → screening → generating → verifying
+    → critiquing → (regenerating)* → filtering → done
+    | awaiting_confirmation → approved | rejected; при сбое — failed.
     """
 
     def __init__(self) -> None:
@@ -104,7 +113,16 @@ class CardWorkflow:
         ожидание человека. Порог приходит аргументом (из настроек
         приложения): workflow не читает конфиг — значение фиксируется
         в истории. job_id уходит в LLM-activities для учёта и логов.
+
+        Рубежи защиты (шаг 9): при поиске фрагменты маскируются
+        (searching), скрининг исключает подозрительные (screening);
+        если чистых фрагментов не осталось — процесс сразу ждёт
+        человека с причиной, генерации не было. Перед отдачей —
+        фильтр выхода (filtering): контакты в карточке маскируются,
+        следы служебных инструкций — эскалация к человеку. Отчёт
+        защиты уходит в БД с финальными статусами.
         """
+        report_json: str | None = None
         try:
             self._status = "parsing"
             await self._set_status(job_id, "parsing")
@@ -133,16 +151,33 @@ class CardWorkflow:
 
             self._status = "searching"
             await self._set_status(job_id, "searching")
+            found = json.loads(
+                await workflow.execute_activity(
+                    search_chunks_activity,
+                    args=[json.dumps(document_ids), hint],
+                    start_to_close_timeout=ACTIVITY_TIMEOUT,
+                    retry_policy=ACTIVITY_RETRY,
+                )
+            )
+
+            self._status = "screening"
+            await self._set_status(job_id, "screening")
             bundle = json.loads(
                 await workflow.execute_activity(
-                    search_context_activity,
-                    args=[json.dumps(document_ids), hint],
+                    screen_context_activity,
+                    args=[job_id, json.dumps(found, ensure_ascii=False)],
                     start_to_close_timeout=ACTIVITY_TIMEOUT,
                     retry_policy=ACTIVITY_RETRY,
                 )
             )
             context = bundle["context"]
             context_chunk_ids = bundle["chunk_ids"]
+            guardrail_report = bundle["report"]
+            report_json = json.dumps(guardrail_report, ensure_ascii=False)
+            if bundle["blocked_reason"] is not None:
+                return await self._await_human(
+                    job_id, None, bundle["blocked_reason"], report_json
+                )
 
             feedback: list[str] = []
             attempts = 0
@@ -180,6 +215,7 @@ class CardWorkflow:
                         return await self._await_human(
                             job_id, draft_json,
                             "выдуманные ссылки: " + "; ".join(violations),
+                            report_json,
                         )
                     citation_failed_once = True
                     feedback = ["Исправь ссылки на источники:"] + [
@@ -206,48 +242,86 @@ class CardWorkflow:
                 if attempts < max_attempts:
                     await self._set_status(job_id, "regenerating")
 
-            card = ProductCard.model_validate_json(draft_json)
+            self._status = "filtering output"
+            await self._set_status(job_id, "filtering")
+            filtered = json.loads(
+                await workflow.execute_activity(
+                    filter_output_activity,
+                    args=[draft_json, report_json],
+                    start_to_close_timeout=ACTIVITY_TIMEOUT,
+                    retry_policy=ACTIVITY_RETRY,
+                )
+            )
+            cleaned_json = json.dumps(filtered["card"], ensure_ascii=False)
+            if filtered["injection_traces"]:
+                return await self._await_human(
+                    job_id, cleaned_json,
+                    "карточка содержит следы служебных инструкций: "
+                    + "; ".join(filtered["injection_traces"]),
+                    report_json,
+                )
+
+            card = ProductCard.model_validate_json(cleaned_json)
             if approved and card.confidence >= confidence_threshold:
                 self._status = "done"
-                await self._set_status(job_id, "done", result_json=draft_json)
-                return draft_json
+                await self._set_status(
+                    job_id, "done", result_json=cleaned_json,
+                    report_json=report_json,
+                )
+                return cleaned_json
 
             reason = (
                 "уверенность ниже порога"
                 if approved
                 else "критик не одобрил карточку"
             )
-            return await self._await_human(job_id, draft_json, reason)
+            return await self._await_human(
+                job_id, cleaned_json, reason, report_json
+            )
         except Exception as exc:
-            await self._set_status(job_id, "failed", error=repr(exc))
+            await self._set_status(
+                job_id, "failed", error=repr(exc), report_json=report_json
+            )
             raise
 
     async def _await_human(
-        self, job_id: str, draft_json: str, reason: str
+        self,
+        job_id: str,
+        draft_json: str | None,
+        reason: str,
+        report_json: str | None = None,
     ) -> str:
         """Устойчивая пауза: карточка ждёт сигнала оператора.
 
         Задача живёт в базе в статусе awaiting_confirmation и переживает
         что угодно; человек смотрит карточку со ссылками на источники
-        и решает сигналом approve или reject.
+        и решает сигналом approve или reject. draft_json=None — защита
+        отклонила все фрагменты до генерации: карточки нет, человек
+        видит только причину. report_json — отчёт защиты, уходит в БД
+        вместе со статусом: оператор видит, что замаскировано и что
+        исключено.
         """
         self._status = f"awaiting human decision ({reason})"
         await self._set_status(
             job_id, "awaiting_confirmation",
-            result_json=draft_json, error=reason,
+            result_json=draft_json, error=reason, report_json=report_json,
         )
         await workflow.wait_condition(lambda: self._human_decision is not None)
 
         if self._human_decision == "approve":
             self._status = "completed"
-            await self._set_status(job_id, "approved", result_json=draft_json)
+            await self._set_status(
+                job_id, "approved",
+                result_json=draft_json, report_json=report_json,
+            )
         else:
             self._status = "rejected by human"
             await self._set_status(
                 job_id, "rejected",
                 result_json=draft_json, error="rejected by operator",
+                report_json=report_json,
             )
-        return draft_json
+        return draft_json or "{}"
 
     async def _set_status(
         self,
@@ -257,11 +331,14 @@ class CardWorkflow:
         result_json: str | None = None,
         error: str | None = None,
         bump_attempts: bool = False,
+        report_json: str | None = None,
     ) -> None:
         """Отдельный шаг процесса: записать статус задачи в БД."""
         await workflow.execute_activity(
             set_status_activity,
-            args=[job_id, status, result_json, error, bump_attempts],
+            args=[
+                job_id, status, result_json, error, bump_attempts, report_json
+            ],
             start_to_close_timeout=STATUS_TIMEOUT,
             retry_policy=ACTIVITY_RETRY,
         )

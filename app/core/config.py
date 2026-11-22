@@ -44,5 +44,7 @@ class Settings(BaseSettings):
     llm_utility_price_input_per_mtok: Decimal = Decimal(0)
     llm_utility_price_output_per_mtok: Decimal = Decimal(0)
 
+    injection_document_threshold: float = 0.5
+
 
 settings = Settings()

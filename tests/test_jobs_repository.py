@@ -5,7 +5,13 @@ from psycopg_pool import PoolTimeout
 
 from app.core.db import connection
 from app.repositories import jobs as jobs_repo
-from app.schemas.cards import CardSeo, CardSource, ProductCard
+from app.schemas.cards import (
+    CardSeo,
+    CardSource,
+    GuardrailReport,
+    MaskedItem,
+    ProductCard,
+)
 
 
 @pytest.fixture()
@@ -72,3 +78,15 @@ def test_set_status_and_get_job(conn, job_ids):
 def test_get_job_missing(conn):
     """Запрос несуществующей задачи возвращает None."""
     assert jobs_repo.get_job(conn, "no-such-id") is None
+
+def test_set_status_stores_guardrail_report(conn, job_ids):
+    """Отчёт защиты сохраняется в задаче и читается обратно (шаг 9)."""
+    job_id, _ = jobs_repo.create_job(conn, {"supplier_text": "x"}, None)
+    job_ids.append(job_id)
+    report = GuardrailReport(
+        masked=[MaskedItem(category="phone", label="телефон номер один")]
+    )
+    jobs_repo.set_status(conn, job_id, "done", guardrail_report=report)
+    job = jobs_repo.get_job(conn, job_id)
+    assert job["guardrail_report"]["masked"][0]["category"] == "phone"
+    assert job["guardrail_report"]["masked"][0]["label"] == "телефон номер один"

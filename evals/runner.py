@@ -56,9 +56,10 @@ async def evaluate_document(filename: str, entry: dict) -> dict:
     document_id = _ensure_document(filename)
     cards_service.parse_pending_documents([document_id])
     cards_service.embed_pending_documents([document_id])
-    context, _chunk_ids = cards_service.build_search_context(
+    results, _report = cards_service.search_chunks(
         [document_id], hint=entry.get("product")
     )
+    context, _chunk_ids = cards_service.assemble_context(results)
     card = await pipeline.generate_card(context)
     verdict = await pipeline.judge_faithfulness(context, card)
     chunks_by_id = _card_chunks(card)

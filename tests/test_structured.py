@@ -3,7 +3,7 @@ import json
 
 import pytest
 
-from app.schemas.cards import CardSeo, CardSource, ProductCard
+from app.schemas.cards import CardSeo, CardSource, CritiqueReport, ProductCard
 from app.services import structured
 from app.services.structured import ResponseParseError, extract_json
 
@@ -113,3 +113,19 @@ async def test_long_title_repaired_pointwise(monkeypatch):
     assert card.description == "Описание"  # описание не переделывалось
     assert "Текущий черновик карточки" in prompts[1]  # точечный запрос
     assert "сделай карточку" not in prompts[1]
+
+def test_critique_report_coerces_dict_issues():
+    """Объекты {assertion: ...} от слабой модели приводятся к строкам."""
+    report = CritiqueReport(
+        verdict="regenerate",
+        issues=[
+            {"assertion": "менеджер"},
+            {"claim": "вода без конкретики"},
+            "обычная строка",
+        ],
+    )
+    assert report.issues == [
+        "менеджер",
+        "вода без конкретики",
+        "обычная строка",
+    ]

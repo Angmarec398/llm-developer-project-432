@@ -11,7 +11,7 @@ from datetime import UTC, datetime
 import psycopg
 from pydantic import ValidationError
 
-from app.schemas.cards import ProductCard
+from app.schemas.cards import GuardrailReport, ProductCard
 
 
 def _now() -> str:
@@ -47,6 +47,7 @@ def create_job(
 def set_status(
     conn: psycopg.Connection, job_id: str, status: str, *, result: ProductCard | None = None,
     error: str | None = None, bump_attempts: bool = False,
+    guardrail_report: GuardrailReport | None = None,
 ) -> None:
     """Сохранение информации о статусе обработки заявки в базе данных"""
     status_info = ["status = %s", "updated_at = %s"]
@@ -54,6 +55,9 @@ def set_status(
     if result is not None:
         status_info.append("result = %s")
         args.append(result.model_dump_json())
+    if guardrail_report is not None:
+        status_info.append("guardrail_report = %s")
+        args.append(guardrail_report.model_dump_json())
     if error is not None:
         status_info.append("error = %s")
         args.append(error)
@@ -64,11 +68,13 @@ def set_status(
         cur.execute(f"UPDATE jobs SET {', '.join(status_info)} WHERE id = %s", args)
 
 
+
 def get_job(conn: psycopg.Connection, job_id: str) -> dict | None:
     """Возвращает информацию по задаче на основании id"""
     with conn.cursor() as cur:
         cur.execute(
-            "SELECT id, status, attempts, result, error FROM jobs WHERE id = %s",
+            "SELECT id, status, attempts, result, error, guardrail_report "
+            "FROM jobs WHERE id = %s",
             (job_id,),
         )
         row = cur.fetchone()
@@ -86,4 +92,15 @@ def get_job(conn: psycopg.Connection, job_id: str) -> dict | None:
             job_info["result"] = draft.model_dump()
         except ValidationError:
             job_info["result"] = None
+    if row[5]:
+        try:
+            report = (
+                GuardrailReport.model_validate(row[5])
+                if isinstance(row[5], dict)
+                else GuardrailReport.model_validate_json(row[5])
+            )
+            job_info["guardrail_report"] = report.model_dump()
+        except ValidationError:
+            job_info["guardrail_report"] = None
     return job_info
+

@@ -16,6 +16,23 @@ class CritiqueReport(BaseModel):
         description="Список проблем: заголовок длиннее 60 символов, "
         "выдуманные характеристики, пустые поля и т.п.",
     )
+    @field_validator("issues", mode="before")
+    @classmethod
+    def _coerce_issue_items(cls, value: list) -> list[str]:
+        """Критик слабой служебной моделью отдаёт объекты вместо строк.
+
+        Встреченная форма: {"assertion": "..."}. Приводим к строке —
+        берём значение поля assertion, иначе первое значение объекта:
+        замечание не теряется, разбор не падает, починка не нужна.
+        """
+        coerced: list[str] = []
+        for item in value or []:
+            if isinstance(item, dict):
+                text = item.get("assertion") or next(iter(item.values()), "")
+                coerced.append(str(text))
+            else:
+                coerced.append(item)
+        return coerced
 
 
 class JobIn(BaseModel):
@@ -108,3 +125,63 @@ class FaithfulnessVerdict(BaseModel):
         default_factory=list,
         description="Утверждения, которых во фрагментах нет",
     )
+
+class InjectionVerdict(BaseModel):
+    """Вердикт точного уровня детектора инъекций (шаг 9): содержит ли
+    фрагмент попытку манипуляции инструкциями ИИ. Заполняет дешёвая
+    служебная модель; решает только второй уровень, первый — правила
+    (app/guardrails/injection.py), которые и решают, идти ли в модель.
+    """
+
+    is_injection: bool = Field(
+        description="true — фрагмент содержит попытку манипуляции "
+        "инструкциями ИИ"
+    )
+    reason: str = Field(
+        default="",
+        description="что именно подозрительного найдено во фрагменте",
+    )
+
+class MaskedItem(BaseModel):
+    """Замаскированное ПДн в отчёте защиты (шаг 9): категория и метка.
+
+    Сырое значение в отчёт не попадает — только метка, которой оно
+    заменено в тексте: отчёт безопасно кладётся в логи, базу и
+    результат задачи.
+    """
+
+    category: str      # phone | email | taxpayer_number | card_number
+    label: str         # «телефон номер один»
+
+
+class ExcludedChunk(BaseModel):
+    """Фрагмент, исключённый из контекста детектором инъекций."""
+
+    chunk_id: int
+    document_id: str
+    reasons: list[str] = Field(default_factory=list)
+
+
+class QuarantinedDocument(BaseModel):
+    """Документ, отозванный к человеку: подозрительных фрагментов
+    больше порога (настройка injection_document_threshold)."""
+
+    document_id: str
+    reason: str
+
+
+class GuardrailReport(BaseModel):
+    """Отчёт защитных рубежей (шаг 9) — часть результата задачи.
+
+    Что замаскировано на входе (masked), какие фрагменты исключены
+    (excluded_chunks), какие документы в карантине (quarantined_
+    documents), что замаскировано в готовой карточке (output_masked).
+    Только метки и причины, без сырых значений ПДн.
+    """
+
+    masked: list[MaskedItem] = Field(default_factory=list)
+    excluded_chunks: list[ExcludedChunk] = Field(default_factory=list)
+    quarantined_documents: list[QuarantinedDocument] = Field(
+        default_factory=list
+    )
+    output_masked: list[MaskedItem] = Field(default_factory=list)
