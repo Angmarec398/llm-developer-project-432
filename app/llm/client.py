@@ -158,7 +158,7 @@ def _record_call(agent: Agent, result, started_at: float) -> None:
             cost=cost,
             duration_ms=duration_ms,
         )
-    except Exception as error:  # noqa: BLE001 — учёт не должен ронять вызов
+    except Exception as error:  # учёт не должен ронять вызов
         log.warning("llm_call_record_failed",
                     agent=agent.name, error=repr(error))
 

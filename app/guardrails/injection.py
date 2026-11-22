@@ -112,7 +112,7 @@ async def screen_text(text: str) -> InjectionScreenResult:
         return InjectionScreenResult(suspicious=False, reasons=[])
     try:
         verdict = await _verdict(_screen_prompt(text, hits))
-    except Exception as error:  # noqa: BLE001 — детектор обязан закрыться
+    except Exception as error:  # детектор обязан закрыться: любой сбой = фрагмент подозрительный
         log.warning(
             "injection_screener_unavailable", error=repr(error), rules=hits
         )

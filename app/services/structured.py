@@ -160,7 +160,7 @@ async def _try_repair_field(
         repaired_card = await repair_field(
             agent, draft, field_name, str(error)
         )
-        return repaired_card  # type: ignore[return-value]
+        return repaired_card
     except (ResponseParseError, ValidationError, json.JSONDecodeError, ModelBehaviorError) as repair_error:
         log.info(
             "field_repair_failed",
@@ -185,10 +185,10 @@ def _repair_prompt(
 
 async def repair_field(
     agent,
-    card: BaseModel,
+    card: ModelT,
     field_name: str,
     issue: str,
-) -> BaseModel:
+) -> ModelT:    
     """Точечно переделать одно поле карточки, не трогая остальные.
 
     Модель получает текущий черновик и текст проблемы, возвращает

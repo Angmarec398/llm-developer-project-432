@@ -39,7 +39,7 @@ def reindex(batch_size: int = BATCH_SIZE) -> int:
         texts = [text for _chunk_id, text in batch]
         try:
             vectors = embedder.embed_documents(texts)
-        except Exception as error:  # noqa: BLE001 — не обрывать досчёт серией ошибок
+        except Exception as error:  # не обрывать досчёт серией ошибок
             log.error("reindex_batch_failed", first_chunk_id=batch[0][0], error=repr(error))
             break
         with connection() as conn:

@@ -114,7 +114,7 @@ def embed_pending_documents(document_ids: list[str]) -> int:
             vectors = embedder.embed_documents(texts)
             with connection() as conn:
                 embedded += chunks_repo.save_embeddings(conn, chunk_ids, vectors)
-        except Exception as error:  # noqa: BLE001 — эмбеддинг не должен ронять задачу
+        except Exception as error:  # эмбеддинг не должен ронять задачу
             log.warning("embed_batch_failed", error=repr(error))
             break
         with connection() as conn:
