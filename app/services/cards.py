@@ -173,6 +173,10 @@ async def screen_chunks(
     возвращаемое значение — причина блокировки, если чистых
     фрагментов не осталось: генерировать не из чего.
     """
+    if not chunks:
+        return [], report, (
+            "поиск не вернул ни одного фрагмента по выбранным документам"
+        )
     excluded_ids: set[int] = set()
     total_by_document: dict[str, int] = {}
     suspicious_by_document: dict[str, int] = {}

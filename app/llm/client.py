@@ -15,6 +15,7 @@ import random
 import time
 from decimal import Decimal
 
+import httpx
 from agents import (
     Agent,
     MultiProvider,
@@ -45,10 +46,17 @@ def setup_llm() -> None:
     global _client_configured, _model_provider
     if _client_configured:
         return
+    # keep-alive отключён: LM Studio рвёт простаивающие соединения (RST),
+    # и ProactorEventLoop на Windows шумит ConnectionResetError в логах
+    http_client = httpx.AsyncClient(
+        limits=httpx.Limits(max_keepalive_connections=0),
+        timeout=settings.llm_timeout_s,
+    )
     client = AsyncOpenAI(
         base_url=settings.llm_base_url,
         api_key=settings.llm_api_key,
         timeout=settings.llm_timeout_s,
+        http_client=http_client,
     )
     set_default_openai_client(client)
     # LM Studio не знает Responses API

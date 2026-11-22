@@ -8,7 +8,8 @@ help:
 	@echo "make worker          - temporal-воркер (workflow + activities)"
 	@echo "make migrate         - применить миграции БД"
 	@echo "make lint            - ruff check app tests"
-	@echo "make lint-fix        - корректировка ошибок линтера
+	@echo "make lint-fix        - корректировка ошибок линтера"
+
 
 infra:
 	docker compose up -d

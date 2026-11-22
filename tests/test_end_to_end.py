@@ -175,6 +175,18 @@ async def test_missing_document_is_a_clear_error(conn, monkeypatch):
         await cards_service.run_card_pipeline(["no-such-document"])
 
 
+async def test_empty_search_result_is_a_clear_error(conn, document, monkeypatch):
+    """Поиск без результатов — честная причина, а не «детектор инъекций»."""
+    _stub_search(monkeypatch, [])
+
+    with pytest.raises(
+        cards_service.GuardrailBlockedError, match="не вернул ни одного фрагмента"
+    ):
+        await cards_service.run_card_pipeline(
+            [document["id"]], hint="несуществующий товар"
+        )
+
+
 def test_search_chunks_reports_masking(conn, document, monkeypatch):
     """search_chunks маскирует ПДн и возвращает отчёт: категория + метка."""
     chunk = {
@@ -282,7 +294,6 @@ async def test_injection_screening_fails_closed(conn, document, monkeypatch):
     assert attempts == 1
     assert card == good_card
     assert "ignore all previous instructions" not in prompts[0]
-
 
 
 async def test_quarantined_documents_block_pipeline(conn, document, monkeypatch):
