@@ -54,7 +54,7 @@ def process_document(document_id: str, file_path: str) -> int:
     except NoTextLayerError as error:
         _fail(document_id, str(error))
         return 0
-    except Exception as error:  # любая ошибка разбора — отказ документа, а не падение процесса
+    except Exception as error:  # noqa: BLE001 — любая ошибка разбора — отказ документа, а не падение процесса
         _fail(document_id, f"ошибка разбора: {error!r}")
         return 0
 
@@ -81,7 +81,7 @@ def _embed_chunks(document_id: str, chunks: list[Chunk]) -> None:
             chunk_ids = chunks_repo.list_chunk_ids(conn, document_id)
             chunks_repo.save_embeddings(conn, chunk_ids, vectors)
         log.info("document_embedded", document_id=document_id, vectors=len(vectors))
-    except Exception as error:  # эмбеддинг не должен ронять разбор
+    except Exception as error:  # noqa: BLE001 — эмбеддинг не должен ронять разбор
         log.warning("document_embed_failed", document_id=document_id, error=repr(error))
 
 
