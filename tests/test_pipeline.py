@@ -1,65 +1,99 @@
-"""Тесты стадий пайплайна: генерация от контекста, критик сверяет с источниками.
+"""Тесты стадий пайплайна с подменой модели: extract → generate → critique."""
+import asyncio
 
-Клиент модели подменён, сеть и LLM не нужны. Цикл перегенерации
-тестируется на уровне оркестрации в сквозном тесте (tests/test_end_to_end.py).
-"""
-import pytest
-
-from app.schemas.cards import CardSeo, CardSource, CritiqueReport, ProductCard
-from app.services import pipeline, structured
-
-CONTEXT = "[1] документ doc-1, фрагмент 1, id 7\nМощность 2200 Вт"
-CARD = ProductCard(
-    title="Чайник 2200 Вт",
-    description="Описание",
-    characteristics={"мощность": "2200 Вт"},
-    benefits=["Быстрый"],
-    seo=CardSeo(slug="chainik-2200"),
-    sources=[CardSource(chunk_id=7, document="doc-1")],
-    confidence=0.9,
-)
+from app.schemas.cards import CardDraft, CritiqueReport, SupplierFacts
+from app.services import pipeline
+from app.services import structured as structured_mod
 
 
-def _mock_run_agent(monkeypatch: pytest.MonkeyPatch, outputs: list) -> list[str]:
-    """Подменить run_agent очередью ответов; вернуть список промптов.
+def _facts() -> SupplierFacts:
+    """Факты о блендере для сценариев."""
+    return SupplierFacts(
+        product_name="Блендер погружной «МиксерПро 800»",
+        characteristics={"Мощность": "800 Вт", "Питание": "220 В"},
+    )
 
-    Патчится в пространстве имён structured: обе стадии зовут
-    run_agent через call_validated.
-    """
+
+def _draft(confidence: float = 0.9) -> CardDraft:
+    """Черновик карточки для сценариев."""
+    return CardDraft(
+        title="МиксерПро 800 — блендер 800 Вт",
+        description="Погружной блендер с металлической ножкой.",
+        characteristics={"Мощность": "800 Вт"},
+        benefits=["Металлическая ножка"],
+        confidence=confidence,
+    )
+
+
+def _mock_llm(monkeypatch, answers: list) -> list[str]:
+    """Подменить вызовы модели очередью ответов (оба модуля-потребителя)."""
     prompts: list[str] = []
-    answers = iter(outputs)
+    queue = iter(answers)
 
     async def fake_run_agent(agent, prompt):
         prompts.append(prompt)
-        return next(answers)
+        result = next(queue)
+        return result if isinstance(result, str) else result.model_dump_json()
 
-    monkeypatch.setattr(structured, "run_agent", fake_run_agent)
+    monkeypatch.setattr(pipeline, "run_agent", fake_run_agent)
+    monkeypatch.setattr(structured_mod, "run_agent", fake_run_agent)
     return prompts
 
 
-async def test_generate_sends_context_to_model(monkeypatch: pytest.MonkeyPatch):
-    """Генерация: промпт содержит контекст с опознаваемым фрагментом."""
-    prompts = _mock_run_agent(monkeypatch, [CARD])
-    card = await pipeline.generate_card(CONTEXT)
-    assert card == CARD
-    assert CONTEXT in prompts[0]
-    assert "id 7" in prompts[0]
+def test_extract_parses_facts(monkeypatch):
+    """Extractor: факты из JSON модели, даже в markdown-заборе."""
+    _mock_llm(monkeypatch, ["```json\n" + _facts().model_dump_json() + "\n```"])
+    facts = asyncio.run(pipeline.extract("текст поставщика"))
+    assert facts.product_name.startswith("Блендер")
+    assert facts.characteristics["Мощность"] == "800 Вт"
 
 
-async def test_generate_includes_feedback(monkeypatch: pytest.MonkeyPatch):
-    """Переделка: замечания (нарушения ссылок, критик) уходят в промпт."""
-    prompts = _mock_run_agent(monkeypatch, [CARD])
-    await pipeline.generate_card(
-        CONTEXT, feedback=["фрагмент 99 не существует в базе"]
+def test_pipeline_approved_on_first_try(monkeypatch):
+    """Критик доволен с первого раза: одна генерация, статус done."""
+    _mock_llm(monkeypatch, [_facts(), _draft(), CritiqueReport(verdict="approve")])
+    draft, attempts, verdict, status = asyncio.run(pipeline.run_pipeline("текст"))
+    assert verdict == "approved"
+    assert status == "done"
+    assert attempts == 1
+    assert draft.title.startswith("МиксерПро")
+
+
+def test_pipeline_regenerates_on_critique(monkeypatch):
+    """Замечания критика уходят в следующую генерацию как feedback."""
+    prompts = _mock_llm(monkeypatch, [
+        _facts(),
+        _draft(), CritiqueReport(verdict="regenerate", issues=["много воды"]),
+        _draft(), CritiqueReport(verdict="approve"),
+    ])
+    draft, attempts, verdict, status = asyncio.run(pipeline.run_pipeline("текст"))
+    assert verdict == "approved"
+    assert attempts == 2
+    # вызовы: extract, generate#1, critique#1, generate#2 — feedback в четвёртом
+    assert "много воды" in prompts[3]
+
+
+def test_pipeline_rejected_after_max_attempts(monkeypatch):
+    """Петля генераций исчерпана — вердикт rejected."""
+    _mock_llm(monkeypatch, [
+        _facts(),
+        _draft(), CritiqueReport(verdict="regenerate", issues=["плохо"]),
+        _draft(), CritiqueReport(verdict="regenerate", issues=["всё ещё плохо"]),
+    ])
+    _draft_out, attempts, verdict, status = asyncio.run(
+        pipeline.run_pipeline("текст", max_attempts=2)
     )
-    assert "Замечания к переделке" in prompts[0]
-    assert "фрагмент 99 не существует в базе" in prompts[0]
+    assert verdict == "rejected"
+    assert status == "rejected"
+    assert attempts == 2
 
 
-async def test_critique_gets_context_and_card(monkeypatch: pytest.MonkeyPatch):
-    """Критик получает и контекст, и карточку: сверяет утверждения с источниками."""
-    prompts = _mock_run_agent(monkeypatch, [CritiqueReport(verdict="approve")])
-    report = await pipeline.critique(CONTEXT, CARD)
-    assert report.verdict == "approve"
-    assert CONTEXT in prompts[0]
-    assert "Чайник 2200 Вт" in prompts[0]
+def test_pipeline_low_confidence_needs_review(monkeypatch):
+    """Одобренная критиком карточка с низкой уверенностью — к человеку."""
+    _mock_llm(monkeypatch, [
+        _facts(), _draft(confidence=0.2), CritiqueReport(verdict="approve"),
+    ])
+    _draft_out, _attempts, verdict, status = asyncio.run(
+        pipeline.run_pipeline("текст")
+    )
+    assert verdict == "approved"
+    assert status == "needs_review"

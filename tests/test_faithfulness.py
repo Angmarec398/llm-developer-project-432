@@ -1,52 +1,55 @@
-"""Тест третьей метрики: вердикт судьи на подмене LLM и расчёт доли.
+"""Тесты модели-судьи: вердикт истинности разбирается из ответа модели."""
+import asyncio
 
-Сеть и LM Studio не нужны: run_agent в structured.py подменяется,
-«ответ модели» — фиксированный JSON.
-"""
-import json
-
-from app.schemas.cards import (
-    CardSeo,
-    CardSource,
-    FaithfulnessVerdict,
-    ProductCard,
-)
-from app.services import pipeline, structured
-from evals.metrics import faithfulness_score
+from app.schemas.cards import CardDraft, FaithfulnessVerdict
+from app.services import pipeline
 
 
-def _minimal_card() -> ProductCard:
-    """Минимально валидная карточка для вызова судьи."""
-    return ProductCard(
-        title="Блендер МиксерПро 800",
-        description="Блендер мощностью 800 Вт со стаканом 1,5 л.",
-        characteristics={"Мощность": "800 Вт"},
-        benefits=["Мерный стакан 1,5 л в комплекте"],
-        seo=CardSeo(slug="blender-miksipro-800"),
-        sources=[CardSource(chunk_id=1, document="паспорт")],
-        confidence=0.9,
+def _card() -> CardDraft:
+    """Минимальная карточка для проверки судьёй."""
+    return CardDraft(
+        title="Чайник 2200 Вт",
+        description="Чайник из нержавеющей стали",
+        characteristics={"мощность": "2200 Вт"},
     )
 
 
-async def test_judge_returns_verdict_on_stubbed_llm(monkeypatch):
-    """Подменённый LLM отдаёт JSON вердикта — call_validated парсит его в модель."""
+def test_judge_verdict_parsed(monkeypatch):
+    """Вердикт судьи из JSON модели: supported/unsupported на месте."""
+    verdict = FaithfulnessVerdict(
+        supported=["мощность 2200 Вт"], unsupported=["цвет белый"]
+    )
 
     async def fake_run_agent(agent, prompt):
-        return json.dumps(
-            {"supported": ["Мощность 800 Вт"], "unsupported": ["Вес 1,2 кг"]},
-            ensure_ascii=False,
-        )
+        return verdict.model_dump_json()
 
-    monkeypatch.setattr(structured, "run_agent", fake_run_agent)
-    verdict = await pipeline.judge_faithfulness("контекст", _minimal_card())
-    assert isinstance(verdict, FaithfulnessVerdict)
-    assert verdict.supported == ["Мощность 800 Вт"]
-    assert verdict.unsupported == ["Вес 1,2 кг"]
+    monkeypatch.setattr(pipeline, "run_agent", fake_run_agent)
+    result = asyncio.run(pipeline.judge_faithfulness("контекст", _card()))
+    assert result.supported == ["мощность 2200 Вт"]
+    assert result.unsupported == ["цвет белый"]
 
 
-def test_faithfulness_score_is_supported_share():
-    """Доля подтверждённых: половина — 0.5; пустой вердикт — 1.0."""
-    half = FaithfulnessVerdict(supported=["a"], unsupported=["b"])
-    assert faithfulness_score(half) == 0.5
-    empty = FaithfulnessVerdict(supported=[], unsupported=[])
-    assert faithfulness_score(empty) == 1.0
+def test_judge_prompt_contains_context_and_card(monkeypatch):
+    """Судья получает и контекст, и карточку в одном промпте."""
+    prompts: list[str] = []
+
+    async def fake_run_agent(agent, prompt):
+        prompts.append(prompt)
+        return FaithfulnessVerdict().model_dump_json()
+
+    monkeypatch.setattr(pipeline, "run_agent", fake_run_agent)
+    asyncio.run(pipeline.judge_faithfulness("фрагменты документов", _card()))
+    assert "фрагменты документов" in prompts[0]
+    assert "Чайник 2200 Вт" in prompts[0]
+
+
+def test_judge_verdict_object_passthrough(monkeypatch):
+    """SDK может вернуть готовый объект — он принимается без разбора."""
+    verdict = FaithfulnessVerdict(supported=["всё"])
+
+    async def fake_run_agent(agent, prompt):
+        return verdict
+
+    monkeypatch.setattr(pipeline, "run_agent", fake_run_agent)
+    result = asyncio.run(pipeline.judge_faithfulness("контекст", _card()))
+    assert result is verdict

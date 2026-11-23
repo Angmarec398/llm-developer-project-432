@@ -21,12 +21,11 @@ from temporalio import activity
 
 from app.core.context import bind_job
 from app.core.db import connection
-from app.guardrails.output import filter_card_output
 from app.repositories import jobs as jobs_repo
-from app.schemas.cards import GuardrailReport, ProductCard
+from app.schemas.cards import CardDraft, GuardrailReport
 from app.services import cards as cards_service
-from app.services import pipeline
 from app.services.documents import process_document
+from app.services.rag_pipeline import critique_with_context
 
 
 @activity.defn
@@ -43,7 +42,7 @@ def set_status_activity(
     report_json — отчёт защиты (шаг 9): пишется вместе с финальными
     статусами, оператор видит, что замаскировано и что исключено.
     """
-    result = ProductCard.model_validate_json(
+    result = CardDraft.model_validate_json(
         result_json) if result_json else None
     report = (
         GuardrailReport.model_validate_json(
@@ -146,7 +145,7 @@ async def generate_activity(
     feedback = json.loads(feedback_json) if feedback_json else None
     with bind_job(job_id):
         structlog.contextvars.bind_contextvars(job_id=job_id)
-        card = await pipeline.generate_card(context, feedback)
+        card = await cards_service.generate_card(context, feedback)
     return card.model_dump_json()
 
 
@@ -157,7 +156,7 @@ def verify_citations_activity(draft_json: str, context_chunk_ids_json: str) -> s
     Каждая ссылка проверяется по двум условиям: фрагмент существует
     в базе и был в поданном контексте. Пустой список — ссылки в порядке.
     """
-    card = ProductCard.model_validate_json(draft_json)
+    card = CardDraft.model_validate_json(draft_json)
     violations = cards_service.verify_card_citations(
         card, json.loads(context_chunk_ids_json)
     )
@@ -170,10 +169,10 @@ async def critique_activity(job_id: str, context: str, draft_json: str) -> str:
 
     job_id привязывается к контексту на время шага (учёт и логи).
     """
-    draft = ProductCard.model_validate_json(draft_json)
+    draft = CardDraft.model_validate_json(draft_json)
     with bind_job(job_id):
         structlog.contextvars.bind_contextvars(job_id=job_id)
-        report = await pipeline.critique(context, draft)
+        report = await critique_with_context(context, draft)
     return report.model_dump_json()
 
 
@@ -198,9 +197,9 @@ def filter_output_activity(draft_json: str, report_json: str) -> str:
     {"card": <очищенный черновик>, "report": <отчёт>, "injection_traces":
     [...]}; непустые traces — процесс уходит к человеку с причиной.
     """
-    card = ProductCard.model_validate_json(draft_json)
+    card = CardDraft.model_validate_json(draft_json)
     report = GuardrailReport.model_validate_json(report_json)
-    cleaned, traces = filter_card_output(card, report)
+    cleaned, report, traces = cards_service.filter_card_output(card, report)
     return json.dumps(
         {
             "card": cleaned.model_dump(),

@@ -41,8 +41,15 @@ def document():
             cur.execute("DELETE FROM documents WHERE id = %s", (document_id,))
 
 
-def test_process_document_indexes_spec(document):
-    """Спецификация доходит до indexed: строки целые, артикул и заголовки на месте."""
+def test_process_document_indexes_spec(document, monkeypatch):
+    """Спецификация доходит до indexed: строки целые, артикулы в метаданных."""
+    import app.rag.reindex as reindex_mod
+
+    def fake_index_pending(conn, doc_id=None, batch=256):
+        """Эмбеддинги в тесте не считаем: модель не грузится."""
+        return 0
+
+    monkeypatch.setattr(reindex_mod, "index_pending_chunks", fake_index_pending)
     document_id, file_path = document("kettle_spec.xlsx")
     saved = process_document(document_id, file_path)
     assert saved > 0
@@ -50,17 +57,16 @@ def test_process_document_indexes_spec(document):
         result = documents_repo.get_document(conn, document_id)
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT text, article FROM chunks WHERE document_id = %s ORDER BY seq",
+                "SELECT text, metadata FROM chunks WHERE doc_id = %s ORDER BY ordinal",
                 (document_id,),
             )
             rows = cur.fetchall()
     assert result["status"] == "indexed"
-    first_text, first_article = rows[0]
-    header_line, *spec_lines = first_text.split("\n")
-    assert "Артикул" in header_line  # заголовки колонок при фрагменте
-    assert first_article
-    for line in spec_lines:
-        assert ": " in line  # «артикул: параметр значение», строка не разорвана
+    assert result["chunks_count"] == saved
+    first_text, first_meta = rows[0]
+    assert first_meta["articul"]  # артикул поднят в метаданные
+    for line in first_text.split("\n"):
+        assert ": " in line  # «артикул: параметр: значение», строка не разорвана
 
 
 def test_process_document_fails_scan_with_reason(document):

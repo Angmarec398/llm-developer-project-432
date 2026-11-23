@@ -1,379 +1,213 @@
-"""Repository-слой: таблица chunks в Postgres.
+"""Repository: векторный upsert и три режима поиска (vector / fts / hybrid RRF).
 
-Фрагменты документа вставляются одным пакетом после разбора;
-seq — порядок фрагмента в документе, назначается здесь по позиции
-в списке, чтобы вызывающий код о нём не думал.
-
-Шаг 6: векторная и полнотекстовая колонки. Эмбеддинги пишутся
-пачкой; поиск — три режима. По векторам: косинусная близость,
-порог отсекает семантический мусор. По словам: ранжирование
-ts_rank, порог отсекает слабые совпадения. Гибрид: слияние двух
-списков по обратным позициям (RRF) — фрагмент получает вклад
-1/(60+ранг) от каждого списка, где найден, поэтому найденный
-обоими оказывается выше; порог фильтрует здесь только векторную
-половину — точное совпадение термина само по себе релевантно.
-
-Шаг 7: get_chunk — один фрагмент по id для проверки ссылок
-карточки (app/services/citations.py); фильтр по метаданным
-принимает список значений (документы выбранные для генерации);
-missing_embeddings_for_documents — досчёт векторов по выбранным
-документам.
+Единственный владелец SQL для поиска по фрагментам. embed_query импортирован
+на уровень модуля — тесты подменяют его фиксированными векторами, модель
+при этом не грузится.
 """
 import psycopg
-from pgvector import Vector
 
-_CHUNK_COLUMNS = "id, document_id, seq, text, page, section, article, brand"
-_FILTER_KEYS = ("document_id", "page", "section", "article", "brand")
+from app.core.config import settings
+from app.rag.embedder import embed_query
+
+# rrf_k из классической формулы Reciprocal Rank Fusion
+RRF_K = 60
 
 
-def save_chunks(
-    conn: psycopg.Connection,
-    document_id: str,
-    chunks: list[dict],
-) -> int:
-    """Массово вставить фрагменты документа, вернуть число вставленных.
-
-    Каждый элемент chunks — dict с ключами text, page, section,
-    article, brand (метаданные могут быть None).
-    """
-    rows = [
-        (
-            document_id,
-            position,
-            chunk["text"],
-            chunk.get("page"),
-            chunk.get("section"),
-            chunk.get("article"),
-            chunk.get("brand"),
-        )
-        for position, chunk in enumerate(chunks)
-    ]
+def upsert_embeddings(conn: psycopg.Connection, items: list[tuple[str, list[float]]]) -> int:
+    """Батч-запись эмбеддингов: [(chunk_id, vector)]. Возвращает число записанных."""
+    if not items:
+        return 0
+    # vector передаём строкой '[1,2,...]' — psycopg не знает тип vector
     with conn.cursor() as cur:
         cur.executemany(
-            """
-            INSERT INTO chunks
-                (document_id, seq, text, page, section, article, brand)
-            VALUES (%s, %s, %s, %s, %s, %s, %s)
-            """,
-            rows,
+            "UPDATE chunks SET embedding = %s::vector WHERE id = %s",
+            [(_vec_str(vector), chunk_id) for chunk_id, vector in items],
         )
-    return len(rows)
+    return len(items)
 
 
-def save_embeddings(
-    conn: psycopg.Connection,
-    chunk_ids: list[int],
-    vectors: list[list[float]],
-) -> int:
-    """Массово записать эмбеддинги фрагментов, вернуть число записанных.
+def _vec_str(vector: list[float]) -> str:
+    """Вектор → строка '[x,y,...]' для каста ::vector в SQL."""
+    return "[" + ",".join(f"{x:.6f}" for x in vector) + "]"
 
-    chunk_ids и vectors идут попарно: i-й вектор — эмбеддинг i-го
-    фрагмента. Одним executemany — векторы приходят и уходят пачкой.
-    """
-    if len(chunk_ids) != len(vectors):
-        raise ValueError("число идентификаторов не равно числу векторов")
-    rows = [(Vector(vector), chunk_id)
-            for chunk_id, vector in zip(chunk_ids, vectors)]
+
+def chunks_without_embedding(
+    conn: psycopg.Connection, limit: int = 256, doc_id: str | None = None
+) -> list[tuple[str, str]]:
+    """Чанки без вектора: (id, text). Для досчёта эмбеддингов (reindex/ingestion)."""
+    sql = "SELECT id, text FROM chunks WHERE embedding IS NULL"
+    args: list = []
+    if doc_id:
+        sql += " AND doc_id = %s"
+        args.append(doc_id)
+    sql += " LIMIT %s"
+    args.append(limit)
     with conn.cursor() as cur:
-        cur.executemany(
-            "UPDATE chunks SET embedding = %s WHERE id = %s",
-            rows,
-        )
-    return len(rows)
-
-
-def missing_embeddings(
-    conn: psycopg.Connection,
-    *,
-    limit: int,
-) -> list[tuple[int, str]]:
-    """Вернуть до limit фрагментов без вектора: пары (id, текст).
-
-    Порядок — по возрастанию id: команда досчёта обходит таблицу
-    стабильно, и повторный запуск ничего не пересчитывает.
-    """
-    with conn.cursor() as cur:
-        cur.execute(
-            """
-            SELECT id, text FROM chunks
-            WHERE embedding IS NULL
-            ORDER BY id
-            LIMIT %(limit)s
-            """,
-            {"limit": limit},
-        )
-        return list(cur.fetchall())
-
-
-def missing_embeddings_for_documents(
-    conn: psycopg.Connection,
-    document_ids: list[str],
-    *,
-    limit: int,
-) -> list[tuple[int, str]]:
-    """Фрагменты без вектора из заданных документов: пары (id, текст).
-
-    Тот же стабильный порядок по id, что и у missing_embeddings,
-    но выборка ограничена списком документов — индексация внутри
-    задачи генерации не трогает чужие документы.
-    """
-    with conn.cursor() as cur:
-        cur.execute(
-            """
-            SELECT id, text FROM chunks
-            WHERE embedding IS NULL
-              AND document_id = ANY(%(document_ids)s)
-            ORDER BY id
-            LIMIT %(limit)s
-            """,
-            {"document_ids": document_ids, "limit": limit},
-        )
-        return list(cur.fetchall())
-
-
-def count_missing_embeddings(conn: psycopg.Connection) -> int:
-    """Сколько фрагментов ещё без вектора — для прогресса досчёта."""
-    with conn.cursor() as cur:
-        cur.execute("SELECT count(*) FROM chunks WHERE embedding IS NULL")
-        return cur.fetchone()[0]
-
-
-def list_chunk_ids(conn: psycopg.Connection, document_id: str) -> list[int]:
-    """Идентификаторы фрагментов документа в порядке seq.
-
-    Порядок совпадает с порядком, в котором фрагменты сохранялись,
-    — по нему эмбеддинги встают на свои места попарно.
-    """
-    with conn.cursor() as cur:
-        cur.execute(
-            "SELECT id FROM chunks WHERE document_id = %s ORDER BY seq",
-            (document_id,),
-        )
-        return [row[0] for row in cur.fetchall()]
-
-
-def get_chunk(conn: psycopg.Connection, chunk_id: int) -> dict | None:
-    """Один фрагмент по id; None, если фрагмента с таким id нет.
-
-    Без score — это не результат поиска, а проверка существования
-    для верификации ссылок карточки.
-    """
-    with conn.cursor() as cur:
-        cur.execute(
-            f"SELECT {_CHUNK_COLUMNS} FROM chunks WHERE id = %s",
-            (chunk_id,),
-        )
-        row = cur.fetchone()
-    if row is None:
-        return None
-    return _chunk_dict(row)
+        cur.execute(sql, args)
+        return cur.fetchall()
 
 
 def search_vector(
-    conn: psycopg.Connection,
-    query_vector: list[float],
-    *,
-    limit: int,
-    min_score: float,
-    filters: dict | None = None,
+    conn: psycopg.Connection, query: str, *, top_k: int | None = None,
+    doc_ids: list[str] | None = None, threshold: float | None = None,
 ) -> list[dict]:
-    """Поиск по смыслу: ближайшие к вектору запроса фрагменты.
-
-    Оценка — косинусная близость (1 − cosine distance); фрагменты
-    ниже порога min_score не возвращаются: мусор в контексте дороже
-    пропуска релевантного.
+    """Top-K по косинусной дистанции (<=>); порог фильтрует после отбора с запасом."""
+    top_k = top_k or settings.retrieval_top_k
+    threshold = settings.retrieval_threshold if threshold is None else threshold
+    vec = _vec_str(embed_query(query))
+    sql = """
+        SELECT c.id, c.doc_id, c.text, c.metadata,
+               d.filename,
+               1 - (c.embedding <=> %s::vector) AS score
+        FROM chunks c JOIN documents d ON d.id = c.doc_id
+        WHERE c.embedding IS NOT NULL AND d.status = 'indexed'
     """
-    params = {
-        "query_vector": Vector(query_vector),
-        "min_score": min_score,
-        "limit": limit,
-        **_filter_params(filters),
-    }
+    args: list = [vec]
+    if doc_ids:
+        sql += " AND c.doc_id = ANY(%s)"
+        args.append(doc_ids)
+    sql += " ORDER BY c.embedding <=> %s::vector LIMIT %s"
+    args += [vec, top_k * 3]  # берём с запасом до фильтра по threshold
     with conn.cursor() as cur:
-        cur.execute(
-            f"""
-            SELECT {_CHUNK_COLUMNS}, score
-            FROM (
-                SELECT {_CHUNK_COLUMNS},
-                       1 - (embedding <=> %(query_vector)s) AS score
-                FROM chunks
-                WHERE embedding IS NOT NULL
-                  AND 1 - (embedding <=> %(query_vector)s) >= %(min_score)s
-                  {_metadata_conditions(filters)}
-            ) AS scored
-            ORDER BY score DESC
-            LIMIT %(limit)s
-            """,
-            params,
-        )
-        return [_to_chunk(row) for row in cur.fetchall()]
+        cur.execute(sql, args)
+        rows = cur.fetchall()
+    return [
+        _row_to_dict(row) for row in rows
+        if row[5] is not None and row[5] >= threshold
+    ][:top_k]
 
 
-def search_fulltext(
-    conn: psycopg.Connection,
-    query: str,
-    *,
-    limit: int,
-    min_score: float,
-    filters: dict | None = None,
+def search_fts(
+    conn: psycopg.Connection, query: str, *, top_k: int | None = None,
+    doc_ids: list[str] | None = None,
 ) -> list[dict]:
-    """Поиск по словам: обычное ранжирование полнотекстового поиска.
-
-    Запрос превращается в tsquery; оценка — ts_rank, фрагменты
-    ниже порога min_score не возвращаются.
+    """Полнотекстовый поиск по tsvector ('russian')."""
+    top_k = top_k or settings.retrieval_top_k
+    sql = """
+        SELECT c.id, c.doc_id, c.text, c.metadata,
+               d.filename,
+               ts_rank(c.tsv, q.query) AS score
+        FROM chunks c JOIN documents d ON d.id = c.doc_id,
+             plainto_tsquery('russian', %s) AS q(query)
+        WHERE c.tsv @@ q.query AND d.status = 'indexed'
     """
-    params = {
-        "query": query,
-        "min_score": min_score,
-        "limit": limit,
-        **_filter_params(filters),
-    }
+    args: list = [query]
+    if doc_ids:
+        sql += " AND c.doc_id = ANY(%s)"
+        args.append(doc_ids)
+    sql += " ORDER BY score DESC LIMIT %s"
+    args.append(top_k)
     with conn.cursor() as cur:
-        cur.execute(
-            f"""
-            SELECT {_CHUNK_COLUMNS}, score
-            FROM (
-                SELECT {_CHUNK_COLUMNS},
-                       ts_rank(tsv, search_query) AS score
-                FROM chunks, plainto_tsquery('russian', %(query)s) AS search_query
-                WHERE tsv @@ search_query
-                  {_metadata_conditions(filters)}
-            ) AS scored
-            WHERE score >= %(min_score)s
-            ORDER BY score DESC
-            LIMIT %(limit)s
-            """,
-            params,
-        )
-        return [_to_chunk(row) for row in cur.fetchall()]
+        cur.execute(sql, args)
+        rows = cur.fetchall()
+    return [_row_to_dict(row) for row in rows]
 
 
 def search_hybrid(
-    conn: psycopg.Connection,
-    query_vector: list[float],
-    query: str,
-    *,
-    limit: int,
-    min_score: float,
-    filters: dict | None = None,
+    conn: psycopg.Connection, query: str, *, top_k: int | None = None,
+    doc_ids: list[str] | None = None, threshold: float | None = None,
 ) -> list[dict]:
-    """Гибридный поиск: слияние векторного и полнотекстового списков.
+    """Гибрид: векторный + полнотекстовый, слияние рангов через RRF.
 
-    Каждый фрагмент получает вклад 1/(60+ранг) от каждого списка,
-    где встретился, — слияние по обратным позициям (RRF), поэтому
-    фрагмент, найденный обоими способами, оказывается выше любого,
-    найденного одним. Порог фильтрует только векторную половину:
-    полнотекстовый кандидат — точное совпадение терминов запроса,
-    он релевантен по построению (так гибрид находит и артикулы,
-    которые по смыслу промахиваются). Оценка результата — суммарный
-    вклад RRF.
+    score = sum(1 / (rrf_k + rank_i)) по спискам результатов.
+    CTE: каждый поиск — свой SELECT с ROW_NUMBER(), JOIN по chunk_id.
     """
-    params = {
-        "query_vector": Vector(query_vector),
-        "query": query,
-        "min_score": min_score,
-        "limit": limit,
-        **_filter_params(filters),
-    }
+    top_k = top_k or settings.retrieval_top_k
+    vec = _vec_str(embed_query(query))
+    sql = """
+        WITH vec AS (
+            SELECT c.id, ROW_NUMBER() OVER (ORDER BY c.embedding <=> %s::vector) AS rank
+            FROM chunks c JOIN documents d ON d.id = c.doc_id
+            WHERE c.embedding IS NOT NULL AND d.status = 'indexed'
+    """
+    args: list = [vec]
+    if doc_ids:
+        sql += " AND c.doc_id = ANY(%s)"
+        args.append(doc_ids)
+    sql += """
+            LIMIT %s
+        ), fts AS (
+            SELECT c.id, ROW_NUMBER() OVER (ORDER BY ts_rank(c.tsv, q.query) DESC) AS rank
+            FROM chunks c JOIN documents d ON d.id = c.doc_id,
+                 plainto_tsquery('russian', %s) AS q(query)
+            WHERE c.tsv @@ q.query AND d.status = 'indexed'
+    """
+    args += [top_k * 2, query]
+    if doc_ids:
+        sql += " AND c.doc_id = ANY(%s)"
+        args.append(doc_ids)
+    sql += """
+            LIMIT %s
+        )
+        SELECT c.id, c.doc_id, c.text, c.metadata, d.filename,
+               COALESCE(1.0/( %s + v.rank), 0) + COALESCE(1.0/( %s + f.rank), 0) AS rrf_score,
+               1 - (c.embedding <=> %s::vector) AS vec_score
+        FROM chunks c
+        JOIN documents d ON d.id = c.doc_id
+        LEFT JOIN vec v ON v.id = c.id
+        LEFT JOIN fts f ON f.id = c.id
+        WHERE v.id IS NOT NULL OR f.id IS NOT NULL
+    """
+    args += [top_k * 2, RRF_K, RRF_K, vec]
+    sql += " ORDER BY rrf_score DESC LIMIT %s"
+    args.append(top_k)
+    with conn.cursor() as cur:
+        cur.execute(sql, args)
+        rows = cur.fetchall()
+    return [
+        {
+            **_row_to_dict((row[0], row[1], row[2], row[3], row[4], row[6])),
+            "rrf_score": float(row[5]),
+        }
+        for row in rows
+    ]
+
+
+def get_chunks_by_ids(conn: psycopg.Connection, ids: list[str]) -> dict[str, dict]:
+    """chunk_id → {doc_id, text, metadata}. Для валидации источников."""
+    if not ids:
+        return {}
     with conn.cursor() as cur:
         cur.execute(
-            f"""
-            WITH vec AS (
-                SELECT {_CHUNK_COLUMNS},
-                       1 - (embedding <=> %(query_vector)s) AS vec_score,
-                       row_number() OVER (
-                           ORDER BY embedding <=> %(query_vector)s
-                       ) AS vec_rank
-                FROM chunks
-                WHERE embedding IS NOT NULL
-                  AND 1 - (embedding <=> %(query_vector)s) >= %(min_score)s
-                  {_metadata_conditions(filters)}
-            ),
-            fts AS (
-                SELECT {_CHUNK_COLUMNS},
-                       ts_rank(tsv, search_query) AS fts_score,
-                       row_number() OVER (
-                           ORDER BY ts_rank(tsv, search_query) DESC
-                       ) AS fts_rank
-                FROM chunks, plainto_tsquery('russian', %(query)s) AS search_query
-                WHERE tsv @@ search_query
-                  {_metadata_conditions(filters)}
-            ),
-            merged AS (
-                SELECT coalesce(v.id, f.id) AS id,
-                       coalesce(v.document_id, f.document_id) AS document_id,
-                       coalesce(v.seq, f.seq) AS seq,
-                       coalesce(v.text, f.text) AS text,
-                       coalesce(v.page, f.page) AS page,
-                       coalesce(v.section, f.section) AS section,
-                       coalesce(v.article, f.article) AS article,
-                       coalesce(v.brand, f.brand) AS brand,
-                        ((coalesce(1.0 / (60 + v.vec_rank), 0.0)
-                         + coalesce(1.0 / (60 + f.fts_rank), 0.0)))::double precision AS score
-
-                FROM vec AS v
-                FULL OUTER JOIN fts AS f ON f.id = v.id
-            )
-            SELECT id, document_id, seq, text, page, section, article, brand, score
-            FROM merged
-            ORDER BY score DESC
-            LIMIT %(limit)s
-            """,
-            params,
+            "SELECT id, doc_id, text, metadata FROM chunks WHERE id = ANY(%s)", (ids,)
         )
-        return [_to_chunk(row) for row in cur.fetchall()]
-
-
-def _metadata_conditions(filters: dict | None) -> str:
-    """Собрать SQL-условия по метаданным.
-
-    Скалярное значение — `AND key = %(key)s`; список —
-    `AND key = ANY(%(key)s)` (psycopg адаптирует list как массив):
-    так фильтр по документам принимает список выбранных документов.
-    """
-    if not filters:
-        return ""
-    conditions = []
-    for key in _FILTER_KEYS:
-        value = filters.get(key)
-        if value is None:
-            continue
-        if isinstance(value, (list, tuple)):
-            conditions.append(f"AND {key} = ANY(%({key})s)")
-        else:
-            conditions.append(f"AND {key} = %({key})s")
-    if not conditions:
-        return ""
-    return "\n                  " + "\n                  ".join(conditions)
-
-
-def _filter_params(filters: dict | None) -> dict:
-    """Взять из фильтров только заданные значения метаданных."""
-    if not filters:
-        return {}
+        rows = cur.fetchall()
     return {
-        key: value
-        for key, value in filters.items()
-        if key in _FILTER_KEYS and value is not None
+        row[0]: {"doc_id": row[1], "text": row[2], "metadata": _as_dict(row[3])}
+        for row in rows
     }
 
 
-def _chunk_dict(row: tuple) -> dict:
-    """dict фрагмента из кортежа колонок _CHUNK_COLUMNS."""
+def get_chunk(conn: psycopg.Connection, chunk_id: str) -> dict | None:
+    """Один фрагмент по id: {chunk_id, doc_id, text, metadata}. None, если нет."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT id, doc_id, text, metadata FROM chunks WHERE id = %s",
+            (chunk_id,),
+        )
+        row = cur.fetchone()
+    if not row:
+        return None
     return {
-        "id": row[0],
-        "document_id": row[1],
-        "seq": row[2],
-        "text": row[3],
-        "page": row[4],
-        "section": row[5],
-        "article": row[6],
-        "brand": row[7],
+        "chunk_id": row[0],
+        "doc_id": row[1],
+        "text": row[2],
+        "metadata": _as_dict(row[3]),
     }
 
 
-def _to_chunk(row: tuple) -> dict:
-    """Превратить строку результата поиска (колонки + score) в dict."""
-    chunk = _chunk_dict(row)
-    chunk["score"] = row[8]
-    return chunk
+def _as_dict(value) -> dict:
+    """JSONB из psycopg приезжает dict'ом; всё прочее считаем пустым."""
+    return value if isinstance(value, dict) else {}
+
+
+def _row_to_dict(row) -> dict:
+    """Строка поиска → словарь результата с float-скором."""
+    return {
+        "chunk_id": row[0],
+        "doc_id": row[1],
+        "text": row[2],
+        "metadata": row[3] if isinstance(row[3], dict) else {},
+        "filename": row[4],
+        "score": float(row[5]) if row[5] is not None else None,
+    }

@@ -1,66 +1,42 @@
-"""Разбор XLSX-спецификации «артикул → параметры».
+"""Парсер XLSX: openpyxl, строки спецификации → блоки «артикул: ключ значение»."""
+import io
 
-Первая строка листа — заголовки колонок (обязательная часть шага:
-число «800» без заголовка «мощность, Вт» ничего не значит). Каждая
-следующая непустая строка превращается в текст вида
-«BLD-800: мощность 800 Вт; чаша 1.5 л» — иначе поиск по смыслу
-её не найдёт. Если в спецификации есть колонка «Бренд», её значение
-уходит в метаданные бренда.
-"""
 from openpyxl import load_workbook
 
-from app.parsers.blocks import Block
+from app.parsers.pdf import Block
 
 
-def parse_xlsx(file_path: str) -> list[Block]:
-    """Превратить каждую строку спецификации в блок-table_row.
+def parse_xlsx(data: bytes, sheet: str | None = None) -> list[Block]:
+    """Разобрать XLSX из байтов: каждая строка спецификации — один блок-таблица."""
+    wb = load_workbook(io.BytesIO(data), read_only=True, data_only=True)
+    ws = wb[sheet] if sheet else wb.active
+    rows = [
+        [("" if cell is None else str(cell)).strip() for cell in row]
+        for row in ws.iter_rows(values_only=True)
+    ]
+    wb.close()
 
-    Артикул — значение первой колонки; он же уходит в метаданные.
-    Строка заголовков сохраняется в table_header: чанкер повторит
-    её в начале каждой части большой таблицы. Страниц у XLSX нет,
-    section заполняется именем листа.
-    """
-    workbook = load_workbook(file_path, read_only=True, data_only=True)
+    # Заголовок — первая непустая строка
+    header_idx = next((i for i, row in enumerate(rows) if any(row)), None)
+    if header_idx is None:
+        return []
+    header = rows[header_idx]
+
     blocks: list[Block] = []
-    for sheet in workbook.worksheets:
-        rows = sheet.iter_rows(values_only=True)
-        header_row = next(rows, None)
-        if not header_row:
+    for row in rows[header_idx + 1:]:
+        if not any(row):
             continue
-        headers = [str(cell).strip() if cell is not None else "" for cell in header_row]
-        table_header = "; ".join(header for header in headers if header)
-        brand_index = next(
-            (index for index, header in enumerate(headers)
-             if header.lower() == "бренд"),
-            None,
+        pairs = {h: v for h, v in zip(header, row) if h and v}
+        articul = pairs.get("Артикул", "")
+        # Строка спецификации → линейный текст «артикул: ключ: значение; …»
+        body = "; ".join(f"{key}: {value}" for key, value in pairs.items())
+        blocks.append(
+            Block(
+                kind="table",
+                content=f"{articul}: {body}" if articul else body,
+                page=1,
+                section="Спецификация",
+                rows=[list(pairs.values())],
+            )
         )
-        for row in row_iter_values(rows):
-            article, *parameter_values = row
-            if article is None or not str(article).strip():
-                continue
-            parameters = [
-                f"{header} {value}"
-                for header, value in zip(headers[1:], parameter_values)
-                if header and value is not None and str(value).strip()
-            ]
-            text = f"{str(article).strip()}: " + "; ".join(parameters)
-            blocks.append(Block(
-                text=text,
-                kind="table_row",
-                section=sheet.title,
-                article=str(article).strip(),
-                brand=(row[brand_index] if brand_index is not None else None),
-                table_header=table_header,
-            ))
-    workbook.close()
     return blocks
-
-
-def row_iter_values(rows) -> list[list]:
-    """Привести строки листа к списку списков значений (пропуская пустые)."""
-    normalized = []
-    for row in rows:
-        values = [str(cell).strip() if cell is not None else None for cell in row]
-        if any(value for value in values):
-            normalized.append(values)
-    return normalized

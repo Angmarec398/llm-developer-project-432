@@ -1,55 +1,53 @@
-"""Тесты сборки контекста: опознаваемость, дедуп, предел размера."""
-from app.rag.context import format_context
+"""Тесты сборки контекста: шапки-источники, дедуп, лимит, извлечение id."""
+from app.rag.context import build_context, context_chunk_ids
 
 
-def _chunk(seq: int, text: str, **overrides) -> dict:
-    """Фрагмент поиска с разумными умолчаниями и переопределениями."""
-    chunk = {
-        "id": seq,
-        "document_id": f"doc-{seq}",
-        "seq": seq,
+def _chunk(chunk_id: str, text: str, page: int = 1, section: str = "") -> dict:
+    """Фрагмент выдачи поиска с метаданными."""
+    return {
+        "chunk_id": chunk_id,
+        "doc_id": "doc1",
         "text": text,
-        "page": None,
-        "section": None,
-        "article": None,
-        "brand": None,
-        "score": 0.9,
+        "metadata": {"doc_id": "doc1", "page": page, "section": section},
+        "filename": "spec.pdf",
     }
-    chunk.update(overrides)
-    return chunk
 
 
-def test_every_chunk_identifiable():
-    """У каждого фрагмента в контексте есть идентификатор для ссылки."""
-    result = format_context([_chunk(1, "Мощность 2200 Вт")])
-    assert "id 1" in result
-    assert "документ doc-1" in result
-    assert "Мощность 2200 Вт" in result
+def test_headers_make_chunks_identifiable():
+    """Каждый фрагмент опознаваем: id, файл, страница и секция в шапке."""
+    context = build_context([
+        _chunk("abc123def456", "Мощность 800 Вт", page=2, section="Характеристики")
+    ])
+    header = context.splitlines()[0]
+    assert "abc123def456" in header
+    assert "spec.pdf" in header
+    assert "2" in header
+    assert "Характеристики" in header
+    assert "Мощность 800 Вт" in context
 
 
-def test_duplicate_text_included_once():
-    """Одинаковый текст из разных документов попадает в контекст один раз."""
-    results = [
-        _chunk(1, "Гарантия 2 года", document_id="doc-a"),
-        _chunk(2, "Гарантия 2 года", document_id="doc-b"),
-        _chunk(3, "Объём 1.7 л", document_id="doc-c"),
-    ]
-    result = format_context(results)
-    assert result.count("Гарантия 2 года") == 1
-    assert "Объём 1.7 л" in result
+def test_duplicates_removed_by_chunk_id():
+    """Один и тот же фрагмент не попадает в контекст дважды."""
+    chunk = _chunk("abc123def456", "текст")
+    context = build_context([chunk, dict(chunk)])
+    assert context.count("abc123def456") == 1
 
 
-def test_context_size_limit():
-    """Блок не длиннее лимита: хвост выдачи отсекается первым."""
-    results = [
-        _chunk(index, f"текст {index} " + "x" * 100) for index in range(1, 6)
-    ]
-    result = format_context(results, max_chars=250)
-    assert len(result) <= 250
-    assert "текст 1" in result
-    assert "текст 5" not in result
+def test_max_chars_limit():
+    """Жёсткий потолок: фрагмент, не влезающий целиком, не берётся."""
+    chunks = [_chunk(f"chunk{i:08d}", "x" * 4000) for i in range(5)]
+    context = build_context(chunks, max_chars=6000)
+    assert len(context) < 6000 + 100
 
 
-def test_empty_search_gives_empty_context():
-    """Пустой поиск — честно пустая строка, без заглушек."""
-    assert format_context([]) == ""
+def test_context_chunk_ids_extracted():
+    """Из собранного контекста восстанавливаются id вошедших фрагментов."""
+    chunks = [_chunk("aaa111bbb222", "первый"), _chunk("ccc333ddd444", "второй")]
+    context = build_context(chunks)
+    assert context_chunk_ids(context) == {"aaa111bbb222", "ccc333ddd444"}
+
+
+def test_empty_chunks_empty_context():
+    """Пустая выдача — пустой контекст без id."""
+    assert build_context([]) == ""
+    assert context_chunk_ids("") == set()

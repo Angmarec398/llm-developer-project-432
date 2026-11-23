@@ -1,78 +1,48 @@
-"""Модуль эмбеддингов: локальная модель на процессоре (sentence-transformers).
+"""Локальные embeddings: sentence-transformers, модель embeddinggemma-300m.
 
-Модель multilingual-e5-small обучена с задачными префиксами: документ
-кодируется с префиксом "passage: ", запрос — "query: ". Без префиксов
-близость релевантных пар проседает так, что нормальный порог отсечения
-выметает верные результаты — префиксы часть контракта модели, берутся
-из её карточки, а не из головы. Модель загружается один раз на процесс
-и кэшируется на диске после первой загрузки; векторы считаются
-пачкой — иначе индексация набора документов растянется на часы.
+Готча модели: запросы и документы эмбеддятся с РАЗНЫМИ префиксами —
+без них качество проседает:
+  query:    "task: search result | query: <текст>"
+  document: "task: search result | title: none | text: <текст>"
+Префиксы — часть контракта модели, выносить их в настройки нельзя.
+Модель грузится лениво (первый вызов), эмбеддинги считаются батчами.
 """
-from __future__ import annotations
-
-from typing import TYPE_CHECKING
-
 from app.core.config import settings
+from app.core.logging import get_logger
 
-if TYPE_CHECKING:
-    from sentence_transformers import SentenceTransformer
+log = get_logger(__name__)
 
-DOCUMENT_PREFIX = "passage: "
-QUERY_PREFIX = "query: "
+QUERY_PREFIX = "task: search result | query: "
+DOC_PREFIX = "task: search result | title: none | text: "
 
-_model: SentenceTransformer | None = None
+_model = None
 
 
-def _get_model() -> SentenceTransformer:
-    """Загрузить модель один раз на процесс (лениво, при первом вызове).
-
-    Импорт внутри функции: тяжёлая зависимость тянется только тогда,
-    когда эмбеддинги реально считаются — тесты и --help её не трогают.
-    """
+def _get_model():
+    """Ленивая загрузка модели: один раз на процесс."""
     global _model
     if _model is None:
         from sentence_transformers import SentenceTransformer
 
-        _model = SentenceTransformer(settings.embedding_model)
+        log.info("embed_model_loading", model=settings.embed_model, device=settings.embed_device)
+        _model = SentenceTransformer(settings.embed_model, device=settings.embed_device)
     return _model
 
 
-def embed_documents(texts: list[str]) -> list[list[float]]:
-    """Закодировать фрагменты документа пачкой (префикс passage).
-
-    Тексты кодируются порциями по embedding_batch_size; порядок
-    векторов совпадает с порядком текстов — репозиторий пишет
-    их пачкой попарно.
-    """
-    return _embed([DOCUMENT_PREFIX + text for text in texts])
-
-
 def embed_query(text: str) -> list[float]:
-    """Закодировать поисковый запрос (префикс query), вернуть один вектор."""
-    return _embed([QUERY_PREFIX + text])[0]
+    """Вектор поискового запроса (с query-префиксом модели)."""
+    return _get_model().encode(QUERY_PREFIX + text, normalize_embeddings=True).tolist()
 
 
-def _embed(prefixed_texts: list[str]) -> list[list[float]]:
-    """Закодировать пачку подготовленных текстов, вернуть список векторов.
-
-    Векторы нормализуются до единичной длины — косинусная близость
-    становится устойчивой к масштабу. Размер каждого вектора сверяется
-    с embedding_dimension: рассинхрон модели и схемы БД ломался бы
-    молча, на стадии поиска; проверка стоит сразу у источника.
-    """
-    if not prefixed_texts:
+def embed_documents(texts: list[str], batch_size: int = 32) -> list[list[float]]:
+    """Векторы документов батчами (с document-префиксом модели)."""
+    if not texts:
         return []
     model = _get_model()
-    vectors: list[list[float]] = []
-    batch_size = settings.embedding_batch_size
-    for start in range(0, len(prefixed_texts), batch_size):
-        batch = prefixed_texts[start: start + batch_size]
-        encoded = model.encode(batch, normalize_embeddings=True)
-        vectors.extend(vector.tolist() for vector in encoded)
-    for vector in vectors:
-        if len(vector) != settings.embedding_dimension:
-            raise ValueError(
-                f"размерность вектора {len(vector)} не совпадает "
-                f"с embedding_dimension={settings.embedding_dimension}"
-            )
-    return vectors
+    vectors = model.encode(
+        [DOC_PREFIX + text for text in texts],
+        batch_size=batch_size,
+        normalize_embeddings=True,
+        show_progress_bar=False,
+    )
+    return vectors.tolist()

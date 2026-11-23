@@ -6,14 +6,14 @@
 """
 from fastapi import APIRouter, HTTPException
 
-from app.schemas.cards import JobIn, ProductCard
+from app.schemas.cards import CardDraft, JobIn
 from app.services import cards as cards_service
 
 router = APIRouter(tags=["cards"])
 
 
-@router.post("/cards", response_model=ProductCard)
-async def create_card(body: JobIn) -> ProductCard:
+@router.post("/cards", response_model=CardDraft)
+async def create_card(body: JobIn) -> CardDraft:
     """Сгенерировать карточку синхронно: документы → поиск → генерация.
 
     Проблемы с документами (не найдены, разобраны с ошибкой) — 422

@@ -13,22 +13,23 @@ run_card_pipeline собирает их в синхронный цикл для 
 from app.core.config import settings
 from app.core.db import connection
 from app.core.logging import get_logger
-from app.guardrails import injection
-from app.guardrails.output import filter_card_output
-from app.guardrails.pii import mask_pii, masked_labels
+from app.guardrails import guard_output
+from app.guardrails.injection import detect_injection_llm, detect_injection_regex
+from app.guardrails.pii import mask_pii
 from app.rag import retrieval
-from app.rag.context import build_context
-from app.repositories import chunks as chunks_repo
+from app.rag.context import build_context, context_chunk_ids
+from app.rag.reindex import index_pending_chunks
 from app.repositories import documents as documents_repo
 from app.schemas.cards import (
+    CardDraft,
     ExcludedChunk,
     GuardrailReport,
     MaskedItem,
-    ProductCard,
     QuarantinedDocument,
 )
-from app.services import citations, pipeline
+from app.services import citations
 from app.services.documents import process_document
+from app.services.rag_pipeline import _coerce_card, critique_with_context
 
 log = get_logger(__name__)
 
@@ -36,7 +37,7 @@ _EMBED_BATCH = 64  # сколько фрагментов доиндексиру�
 
 
 class GuardrailBlockedError(ValueError):
-    """Все фрагменты отклонены защитой: генерировать не из чего (шаг 9).
+    """Все фрагменты отклонены защитой: генерировать не из чего.
 
     Синхронный эндпоинт (POST /cards) превращает её в ответ 422 с
     причиной; устойчивый процесс (CardWorkflow) вместо исключения
@@ -75,7 +76,7 @@ def parse_pending_documents(document_ids: list[str]) -> dict[str, int]:
     """Разобрать документы, которые ещё не проиндексированы.
 
     Возвращает {document_id: число сохранённых фрагментов} по реально
-    разобранным. Уже проиндексированные не трогает — повторный разбор
+    разобранным. Уже проиндексированные не трогаем — повторный разбор
     дал бы дубли фрагментов.
     """
     parsed = {}
@@ -85,7 +86,7 @@ def parse_pending_documents(document_ids: list[str]) -> dict[str, int]:
             for document_id in document_ids
         }
     for document_id, document in documents.items():
-        if document is None or document["status"] == "indexed":
+        if document is None or document["status"] in ("indexed", "embed_failed"):
             continue
         saved = process_document(document_id, document["file_path"])
         if saved:
@@ -100,34 +101,22 @@ def embed_pending_documents(document_ids: list[str]) -> int:
     пачки ловится и идёт в лог — без вектора фрагменты доберёт
     команда досчёта (make reindex), задача из-за этого не падает.
     """
-    from app.rag import embedder  # тяжёлая модель — импорт по месту вызова
-
     embedded = 0
-    with connection() as conn:
-        missing = chunks_repo.missing_embeddings_for_documents(
-            conn, document_ids, limit=_EMBED_BATCH
-        )
-    while missing:
-        chunk_ids = [chunk_id for chunk_id, _text in missing]
-        texts = [text for _chunk_id, text in missing]
+    for document_id in document_ids:
         try:
-            vectors = embedder.embed_documents(texts)
             with connection() as conn:
-                embedded += chunks_repo.save_embeddings(conn, chunk_ids, vectors)
+                embedded += index_pending_chunks(
+                    conn, doc_id=document_id, batch=_EMBED_BATCH
+                )
         except Exception as error:  # noqa: BLE001 — эмбеддинг не должен ронять задачу
-            log.warning("embed_batch_failed", error=repr(error))
-            break
-        with connection() as conn:
-            missing = chunks_repo.missing_embeddings_for_documents(
-                conn, document_ids, limit=_EMBED_BATCH
-            )
+            log.warning("embed_batch_failed", document_id=document_id, error=repr(error))
     return embedded
 
 
 def search_chunks(
     document_ids: list[str], hint: str | None
 ) -> tuple[list[dict], GuardrailReport]:
-    """Найти фрагменты и замаскировать в них ПДн (первый рубеж, шаг 9).
+    """Найти фрагменты и замаскировать в них ПДн (первый рубеж защиты).
 
     Запрос — подсказка оператора, а без неё — заголовки (имена файлов)
     выбранных документов. Поиск гибридный, фильтр — по списку выбранных
@@ -139,30 +128,29 @@ def search_chunks(
     Второе возвращаемое значение — отчёт: что замаскировано.
     """
     query = hint or _documents_titles(document_ids)
-    results = retrieval.search(
-        query, mode="hybrid", filters={"document_id": document_ids}
-    )
+    results = retrieval.search(query, mode="hybrid", doc_ids=document_ids)
     report = GuardrailReport()
     masked_results: list[dict] = []
     for chunk in results:
-        masked = mask_pii(chunk["text"])
+        masked_text, entities = mask_pii(chunk["text"])
         report.masked.extend(
-            MaskedItem(category=category, label=label)
-            for category, label in masked_labels(masked.findings)
+            MaskedItem(category=entity.kind, label=entity.placeholder)
+            for entity in entities
         )
-        masked_results.append({**chunk, "text": masked.text})
+        masked_results.append({**chunk, "text": masked_text})
     return masked_results, report
 
 
-def assemble_context(results: list[dict]) -> tuple[str, list[int]]:
-    """Собрать контекст из (замаскированных) фрагментов: текст + id."""
-    return build_context(results)
+def assemble_context(results: list[dict]) -> tuple[str, list[str]]:
+    """Собрать контекст из (замаскированных) фрагментов: текст + id вошедших."""
+    context = build_context(results)
+    return context, sorted(context_chunk_ids(context))
 
 
 async def screen_chunks(
     chunks: list[dict], report: GuardrailReport
 ) -> tuple[list[dict], GuardrailReport, str | None]:
-    """Скрининг фрагментов детектором инъекций (второй рубеж, шаг 9).
+    """Скрининг фрагментов детектором инъекций (второй рубеж защиты).
 
     Каждый фрагмент проверяет двухуровневый детектор (правила, затем —
     по помеченным — служебная модель; app/guardrails/injection.py).
@@ -177,32 +165,46 @@ async def screen_chunks(
         return [], report, (
             "поиск не вернул ни одного фрагмента по выбранным документам"
         )
-    excluded_ids: set[int] = set()
+    excluded_ids: set[str] = set()
     total_by_document: dict[str, int] = {}
     suspicious_by_document: dict[str, int] = {}
     for chunk in chunks:
-        document_id = chunk["document_id"]
+        document_id = chunk["doc_id"]
         total_by_document[document_id] = (
             total_by_document.get(document_id, 0) + 1
         )
-        screen_result = await injection.screen_text(chunk["text"])
-        if not screen_result.suspicious:
+        regex_verdict = detect_injection_regex(chunk["text"])
+        if not regex_verdict.suspicious:
+            continue
+        reasons = [regex_verdict.reason]
+        try:
+            llm_verdict = await detect_injection_llm(chunk["text"])
+            confirmed = llm_verdict.suspicious
+            if llm_verdict.reason:
+                reasons.append(llm_verdict.reason)
+        except Exception as error:  # noqa: BLE001 — fail-closed: сбой детектора = фрагмент подозрительный
+            log.warning(
+                "injection_llm_failed",
+                chunk_id=chunk["chunk_id"], error=repr(error),
+            )
+            confirmed = True
+        if not confirmed:
             continue
         suspicious_by_document[document_id] = (
             suspicious_by_document.get(document_id, 0) + 1
         )
         report.excluded_chunks.append(
             ExcludedChunk(
-                chunk_id=chunk["id"],
-                document_id=document_id,
-                reasons=screen_result.reasons,
+                chunk_id=chunk["chunk_id"],
+                doc_id=document_id,
+                reasons=reasons,
             )
         )
-        excluded_ids.add(chunk["id"])
+        excluded_ids.add(chunk["chunk_id"])
         log.info(
             "guardrail_chunk_excluded",
-            chunk_id=chunk["id"],
-            reasons=screen_result.reasons,
+            chunk_id=chunk["chunk_id"],
+            reasons=reasons,
         )
 
     quarantined_ids: set[str] = set()
@@ -215,7 +217,7 @@ async def screen_chunks(
                 f"(порог {settings.injection_document_threshold})"
             )
             report.quarantined_documents.append(
-                QuarantinedDocument(document_id=document_id, reason=reason)
+                QuarantinedDocument(doc_id=document_id, reason=reason)
             )
             quarantined_ids.add(document_id)
             log.warning(
@@ -227,31 +229,69 @@ async def screen_chunks(
     clean = [
         chunk
         for chunk in chunks
-        if chunk["id"] not in excluded_ids
-        and chunk["document_id"] not in quarantined_ids
+        if chunk["chunk_id"] not in excluded_ids
+        and chunk["doc_id"] not in quarantined_ids
     ]
     blocked_reason = None
     if not clean:
         blocked_reason = "; ".join(
-            f"документ {item.document_id}: {item.reason}"
+            f"документ {item.doc_id}: {item.reason}"
             for item in report.quarantined_documents
         ) or "все фрагменты отклонены детектором инъекций"
     return clean, report, blocked_reason
 
 
+async def generate_card(context: str, feedback: list[str] | None = None) -> CardDraft:
+    """Сгенерировать карточку по контексту (без ретраев — ими управляет цикл).
+
+    Ссылки на источники проверяет отдельный шаг (verify_card_citations):
+    генератор и проверка разнесены, чтобы нарушение было видно в истории
+    процесса своим состоянием.
+    """
+    from app.agents.prompts import context_generator_agent
+    from app.llm.client import run_agent
+    from app.rag.context import CONTEXT_INSTRUCTION
+
+    prefix = ""
+    if feedback:
+        prefix = "Замечания, учти:\n" + "\n".join(f"- {issue}" for issue in feedback) + "\n\n"
+    out = await run_agent(
+        context_generator_agent, prefix + CONTEXT_INSTRUCTION + "\nКОНТЕКСТ:\n" + context
+    )
+    return _coerce_card(out)
+
+
 def verify_card_citations(
-    card: ProductCard, context_chunk_ids: list[int]
+    card: CardDraft, context_ids: list[str]
 ) -> list[str]:
     """Проверить ссылки карточки: фрагмент существует и был в контексте."""
     with connection() as conn:
-        return citations.verify_citations(conn, card, context_chunk_ids)
+        return citations.verify_citations(conn, card, context_ids)
+
+
+def filter_card_output(
+    card: CardDraft, report: GuardrailReport
+) -> tuple[CardDraft, GuardrailReport, list[str]]:
+    """Фильтр выхода (третий рубеж): ПДн в карточке маскируются, следы
+    служебных инструкций — эскалация к человеку (непустой третий элемент).
+    """
+    card_json = card.model_dump_json()
+    masked_json, entities = mask_pii(card_json)
+    if entities:
+        report.output_masked.extend(
+            MaskedItem(category=entity.kind, label=entity.placeholder)
+            for entity in entities
+        )
+    cleaned_json, issues = guard_output(masked_json)
+    traces = [issue for issue in issues if "след инъекции" in issue]
+    return CardDraft.model_validate_json(cleaned_json), report, traces
 
 
 async def run_card_pipeline(
     document_ids: list[str],
     hint: str | None = None,
     max_attempts: int = 3,
-) -> tuple[ProductCard, int, str, GuardrailReport]:
+) -> tuple[CardDraft, int, str, GuardrailReport]:
     """Полный цикл синхронно (POST /cards): подготовка → поиск → генерация.
 
     Возвращает (карточку, число генераций, вердикт, отчёт защиты).
@@ -262,7 +302,7 @@ async def run_card_pipeline(
     правдоподобным видом) — эскалация к человеку; rejected — петля
     генераций исчерпана; output_contamination — в карточке найдены
     следы служебных инструкций: эскалация к человеку. Контекст
-    собирается из замаскированных фрагментов (шаг 9): ПДн заменены
+    собирается из замаскированных фрагментов: ПДн заменены
     метками до промпта и до логов. Все фрагменты отклонены защитой —
     GuardrailBlockedError с причиной и отчётом (эндпоинт отвечает 422).
     """
@@ -277,17 +317,17 @@ async def run_card_pipeline(
     )
     if blocked_reason is not None:
         raise GuardrailBlockedError(blocked_reason, guardrail_report)
-    context, context_chunk_ids = assemble_context(screened)
+    context, context_ids = assemble_context(screened)
 
     feedback: list[str] = []
     citation_failed_once = False
     attempts = 0
-    card: ProductCard | None = None
+    card: CardDraft | None = None
     approved = False
     while attempts < max_attempts:
         attempts += 1
-        card = await pipeline.generate_card(context, feedback or None)
-        violations = verify_card_citations(card, context_chunk_ids)
+        card = await generate_card(context, feedback or None)
+        violations = verify_card_citations(card, context_ids)
         if violations:
             log.info(
                 "pipeline_citation_violation",
@@ -300,7 +340,7 @@ async def run_card_pipeline(
                 return card, attempts, "citation_fraud", guardrail_report
             citation_failed_once = True
             continue
-        report = await pipeline.critique(context, card)
+        report = await critique_with_context(context, card)
         if report.verdict == "approve":
             approved = True
             break
@@ -308,7 +348,7 @@ async def run_card_pipeline(
         log.info("pipeline_regenerate", attempt=attempts, issues=report.issues)
 
     assert card is not None  # цикл исполняется хотя бы раз: max_attempts >= 1
-    card, output_traces = filter_card_output(card, guardrail_report)
+    card, guardrail_report, output_traces = filter_card_output(card, guardrail_report)
     if output_traces:
         log.warning("guardrail_output_contamination", traces=output_traces)
         return card, attempts, "output_contamination", guardrail_report

@@ -1,32 +1,80 @@
-"""Разбор PDF: текст извлекается постранично.
+"""Парсер PDF: pdfplumber, постраничный текст + таблицы.
 
-Отдельно обрабатывается отсканированный документ: текстового слоя
-в нём нет, и молча вернуть пустой результат нельзя — пустая карточка
-без объяснения выглядит как поломка сервиса. Поэтому парсер бросает
-NoTextLayerError, а сервис ставит документу отказ с причиной.
+Каждая структурная единица (блок) знает свою страницу — метаданные чанка.
+Скан без текстового слоя — честный отказ PdfNoTextLayer, а не пустой результат.
 """
-from pypdf import PdfReader
+import io
+from dataclasses import dataclass, field
 
-from app.parsers.blocks import Block
-
-
-class NoTextLayerError(Exception):
-    """В PDF нет текстового слоя (скан) — без OCR разбор невозможен."""
+import pdfplumber
 
 
-def parse_pdf(file_path: str) -> list[Block]:
-    """Извлечь текст из PDF постранично.
+@dataclass
+class Block:
+    """Структурная единица документа: параграф текста или таблица."""
+    kind: str                 # "text" | "table"
+    content: str
+    page: int
+    section: str = ""         # последний заголовок выше по документу
+    rows: list[list[str]] = field(default_factory=list)  # для kind="table"
 
-    Каждая непустая страница становится блоком со своим номером
-    (нумерация с 1 — для ссылки на источник). Если текста нет ни на
-    одной странице, бросает NoTextLayerError.
-    """
-    reader = PdfReader(file_path)
+
+class PdfNoTextLayer(Exception):
+    """В PDF нет извлекаемого текста — только картинки."""
+
+
+def parse_pdf(data: bytes) -> list[Block]:
+    """Разобрать PDF из байтов в блоки: параграфы текста и таблицы постранично."""
     blocks: list[Block] = []
-    for page_number, page in enumerate(reader.pages, start=1):
-        text = (page.extract_text() or "").strip()
-        if text:
-            blocks.append(Block(text=text, page=page_number))
-    if not blocks:
-        raise NoTextLayerError(f"в файле нет текстового слоя: {file_path}")
+    with pdfplumber.open(io.BytesIO(data)) as pdf:
+        has_any_text = False
+        for page_no, page in enumerate(pdf.pages, start=1):
+            text = page.extract_text() or ""
+            if text.strip():
+                has_any_text = True
+            for para in _split_paragraphs(text):
+                section = _heading(para)
+                if section:
+                    blocks.append(Block("text", para, page_no, section=section))
+                else:
+                    blocks.append(Block("text", para, page_no))
+            for table in page.extract_tables():
+                rows = [[(cell or "").strip() for cell in row] for row in table]
+                blocks.append(Block("table", _table_to_text(rows), page_no, rows=rows))
+        if not has_any_text and not blocks:
+            raise PdfNoTextLayer("PDF без текстового слоя (скан?): нужен OCR")
     return blocks
+
+
+def _split_paragraphs(text: str) -> list[str]:
+    """Разбить текст страницы на параграфы по пустой строке."""
+    paras = [p.strip() for p in text.split("\n\n") if p.strip()]
+    if paras:
+        return paras
+    stripped = text.strip()
+    return [stripped] if stripped else []
+
+
+def _heading(para: str) -> str:
+    """Эвристика заголовка: ВСЕ КАПС или короткая строка без точки."""
+    if para.isupper() and 3 < len(para) < 80:
+        return para.title()
+    if len(para) < 60 and not para.endswith((".", ";", ",")) and para.count(" ") <= 6:
+        return para
+    return ""
+
+
+def _table_to_text(rows: list[list[str]]) -> str:
+    """Таблица → линейный текст «ключ: значение» / «колонка: значение»."""
+    if not rows:
+        return ""
+    header = rows[0]
+    lines = []
+    for row in rows[1:]:
+        if len(header) == 2 and header[0].lower() in ("параметр", "характеристика"):
+            # Таблица «параметр — значение»: сохраняем как есть
+            lines.append(f"{row[0]}: {row[1] if len(row) > 1 else ''}")
+        else:
+            cells = [f"{h}={v}" for h, v in zip(header, row) if v]
+            lines.append("; ".join(cells))
+    return "\n".join(lines)

@@ -1,116 +1,107 @@
-"""Резка нормализованных блоков документа на фрагменты (чанки).
+"""Чанкер: fixed-size + overlap для текста, layout-aware для таблиц.
 
-Два режима из PDF шага 5:
-- текст режется фиксированным размером с перекрытием — утверждение,
-  попавшее на границу фрагментов, не теряется;
-- таблица режется по строкам: строку рвать нельзя, и каждая часть
-  большой таблицы начинается со строки заголовков колонок — иначе
-  «800» без «мощность, Вт» ничего не значит.
-
-Метаданные (страница, секция, артикул, бренд) наследуются от блока;
-по ним потом фильтруется поиск и строится ссылка на источник.
+Metadata каждого чанка: {doc_id, page, section, articul, brand}.
+Артикул/бренд вытаскиваются regex'ом из текста чанка.
 """
-from dataclasses import dataclass
+import re
+import uuid
 
-from app.parsers.blocks import Block
+from app.parsers.pdf import Block
 
+CHUNK_SIZE = 700      # символов
+CHUNK_OVERLAP = 120
 
-@dataclass
-class Chunk:
-    """Фрагмент документа, готовый к сохранению в базу."""
-
-    text: str
-    page: int | None = None
-    section: str | None = None
-    article: str | None = None
-    brand: str | None = None
+_ARTICUL_RE = re.compile(r"\b[A-Z]{2,5}-[A-Z0-9]{2,6}\b")
+_BRANDS = ("МиксерПро", "КеттлПро", "АкваТерм", "ТехноДом")
 
 
-def chunk_blocks(blocks: list[Block], size: int, overlap: int) -> list[Chunk]:
-    """Разрезать последовательность блоков на фрагменты.
+def chunk_blocks(
+    blocks: list[Block],
+    doc_id: str,
+    *,
+    size: int = CHUNK_SIZE,
+    overlap: int = CHUNK_OVERLAP,
+) -> list[dict]:
+    """Блоки → чанки-словари с метаданными.
 
-    Порядок блоков сохраняется: фрагменты выходят в том же порядке,
-    в каком блоки шли в документе (это потом станет полем seq в БД).
-    Перекрытие должно быть меньше размера фрагмента, иначе шаг
-    не положительный и резка не сходится.
+    Таблица — layout-aware: не рвём строку; большая таблица делится
+    по строкам, каждая часть несёт контекст (шапку таблицы).
     """
-    if overlap >= size:
-        raise ValueError("перекрытие должно быть меньше размера фрагмента")
-    chunks: list[Chunk] = []
-    index = 0
-    while index < len(blocks):
-        block = blocks[index]
-        if block.kind == "table_row":
-            table_rows, index = _take_table(blocks, index)
-            chunks.extend(_chunk_table(table_rows, size))
+    chunks: list[dict] = []
+    for block in blocks:
+        if block.kind == "table":
+            pieces = _split_table(block, size)
+            for piece in pieces:
+                chunks.append(_make_chunk(piece, block, doc_id))
         else:
-            chunks.extend(_chunk_text(block, size, overlap))
-            index += 1
+            for piece in _split_text(block.content, size, overlap):
+                chunks.append(_make_chunk(piece, block, doc_id))
+    for index, chunk in enumerate(chunks):
+        chunk["ordinal"] = index
     return chunks
 
 
-def _take_table(blocks: list[Block], start: int) -> tuple[list[Block], int]:
-    """Забрать подряд идущие строки одной таблицы, начиная с позиции start."""
-    header = blocks[start].table_header
-    table_rows: list[Block] = []
-    index = start
-    while index < len(blocks):
-        block = blocks[index]
-        if block.kind != "table_row" or block.table_header != header:
-            break
-        table_rows.append(block)
-        index += 1
-    return table_rows, index
-
-
-def _chunk_text(block: Block, size: int, overlap: int) -> list[Chunk]:
-    """Разрезать текстовый блок окнами длиной size с шагом size - overlap."""
-    text = block.text
+def _split_text(text: str, size: int, overlap: int) -> list[str]:
+    """Резка текста с перекрытием; слово посередине не рвём."""
     if len(text) <= size:
-        return [_inherit(block, text)]
-    chunks: list[Chunk] = []
-    step = size - overlap
-    position = 0
-    while position < len(text):
-        piece = text[position : position + size].strip()
-        if piece:
-            chunks.append(_inherit(block, piece))
-        position += step
-    return chunks
+        return [text]
+    pieces = []
+    start = 0
+    while start < len(text):
+        end = start + size
+        if end < len(text):
+            # Параграф не рвём посередине слова — откатываемся до пробела
+            cut = text.rfind(" ", start + size // 2, end)
+            if cut > start:
+                end = cut
+        pieces.append(text[start:end].strip())
+        if end >= len(text):
+            break
+        start = end - overlap
+    return [piece for piece in pieces if piece]
 
 
-def _chunk_table(table_rows: list[Block], size: int) -> list[Chunk]:
-    """Разрезать таблицу, не разрывая строки и повторяя заголовки.
-
-    Новая часть начинается, когда очередная строка не помещается
-    в текущий фрагмент; каждая часть открывается строкой заголовков.
-    Строка длиннее size уходит отдельным фрагментом — строку
-    рвать нельзя даже ценой превышения размера.
-    """
-    header = table_rows[0].table_header or ""
-    chunks: list[Chunk] = []
-    current_lines = [header]
-    current_first_row = table_rows[0]
-    for row in table_rows:
-        candidate = "\n".join([*current_lines, row.text])
-        if len(candidate) > size and len(current_lines) > 1:
-            chunks.append(_inherit(current_first_row, "\n".join(current_lines)))
-            current_lines = [header, row.text]
-            current_first_row = row
+def _split_table(block: Block, size: int) -> list[str]:
+    """Строку таблицы не рвём; режем между строками, каждая часть с заголовком."""
+    lines = block.content.split("\n")
+    header_line = lines[0] if lines else ""
+    pieces: list[str] = []
+    current: list[str] = []
+    current_len = 0
+    for line in lines:
+        if current_len + len(line) > size and current:
+            pieces.append("\n".join(current))
+            # Шапка таблицы дублируется в каждую часть — контекст колонок
+            if header_line and not current[0].startswith(header_line.split(":")[0]):
+                current = [f"[шапка] {header_line}", line]
+                current_len = len(header_line) + len(line)
+                continue
+            current = [line]
+            current_len = len(line)
         else:
-            current_lines.append(row.text)
-    if len(current_lines) > 1:
-        chunks.append(_inherit(current_first_row, "\n".join(current_lines)))
-    return chunks
+            current.append(line)
+            current_len += len(line)
+    if current:
+        pieces.append("\n".join(current))
+    return pieces
 
 
-
-def _inherit(block: Block, text: str) -> Chunk:
-    """Собрать фрагмент из текста, унаследовав метаданные блока."""
-    return Chunk(
-        text=text,
-        page=block.page,
-        section=block.section,
-        article=block.article,
-        brand=block.brand,
-    )
+def _make_chunk(text: str, block: Block, doc_id: str) -> dict:
+    """Собрать чанк-словарь: id, текст, метаданные (doc_id/page/section/артикул/бренд)."""
+    meta = {
+        "doc_id": doc_id,
+        "page": block.page,
+        "section": block.section or "",
+    }
+    articul = _ARTICUL_RE.search(text)
+    if articul:
+        meta["articul"] = articul.group(0)
+    for brand in _BRANDS:
+        if brand in text:
+            meta["brand"] = brand
+            break
+    return {
+        "id": uuid.uuid4().hex[:12],
+        "text": text,
+        "metadata": meta,
+    }

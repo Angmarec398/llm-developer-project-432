@@ -1,19 +1,16 @@
-"""Тесты проверки ссылок карточки на живой базе (нужен postgres).
+"""Тесты проверки ссылок: фрагмент существует в базе и был в контексте.
 
-Сценарии: валидные ссылки; ссылка на несуществующий фрагмент;
-ссылка на существующий, но не поданный в контекст фрагмент
-(выдумывание с правдоподобным видом); смешанный случай с дублем.
+Нужна живая база (make infra && make migrate); без неё тесты пропускаются.
 """
-from uuid import uuid4
+import uuid
 
 import psycopg
 import pytest
 from psycopg_pool import PoolTimeout
 
 from app.core.db import connection
-from app.repositories import chunks as chunks_repo
 from app.repositories import documents as documents_repo
-from app.schemas.cards import CardSeo, CardSource, ProductCard
+from app.schemas.cards import CardDraft, SourceRef
 from app.services import citations
 
 
@@ -28,78 +25,69 @@ def conn():
 
 
 @pytest.fixture()
-def chunk_ids(conn):
-    """Два тестовых фрагмента; документ удаляется по завершении."""
+def document(conn):
+    """Документ с двумя фрагментами в базе; чистится после теста."""
     doc_id, _created = documents_repo.create_document(
-        conn,
-        filename="citations-test",
-        file_path="data/citations-test",
-        content_hash=uuid4().hex,
+        conn, "cite-test", "data/cite-test", uuid.uuid4().hex
     )
-    chunks_repo.save_chunks(conn, doc_id, [
-        {"text": "Мощность 2200 Вт"},
-        {"text": "Объём 1.7 л"},
+    with conn.cursor() as cur:  # зачистка после возможного прошлого падения
+        cur.execute("DELETE FROM chunks WHERE id IN ('citec1', 'citec2')")
+    documents_repo.insert_chunks(conn, [
+        {
+            "id": "citec1",
+            "text": "Мощность 800 Вт",
+            "ordinal": 0,
+            "metadata": {"doc_id": doc_id, "page": 1},
+        },
+        {
+            "id": "citec2",
+            "text": "Гарантия 24 месяца",
+            "ordinal": 1,
+            "metadata": {"doc_id": doc_id, "page": 1},
+        },
     ])
-    ids = chunks_repo.list_chunk_ids(conn, doc_id)
-    yield ids
+    yield doc_id
     with conn.cursor() as cur:
         cur.execute("DELETE FROM documents WHERE id = %s", (doc_id,))
 
 
-def _free_chunk_id(conn) -> int:
-    """Идентификатор, которого точно нет в таблице фрагментов."""
-    with conn.cursor() as cur:
-        cur.execute("SELECT coalesce(max(id), 0) + 1000000 FROM chunks")
-        return cur.fetchone()[0]
-
-
-def _card(*source_chunk_ids: int) -> ProductCard:
+def _card(*chunk_ids: str) -> CardDraft:
     """Карточка, ссылающаяся на заданные фрагменты."""
-    return ProductCard(
-        title="Чайник",
+    return CardDraft(
+        title="Чайник 2200 Вт",
         description="Описание",
-        seo=CardSeo(slug="chainik"),
-        sources=[
-            CardSource(chunk_id=chunk_id, document="citations-test")
-            for chunk_id in source_chunk_ids
-        ],
-        confidence=0.9,
+        sources=[SourceRef(chunk_id=chunk_id) for chunk_id in chunk_ids],
     )
 
 
-def test_valid_citations_pass(conn, chunk_ids):
-    """Ссылки на существующие фрагменты из контекста — нарушений нет."""
-    card = _card(chunk_ids[0], chunk_ids[1])
+def test_valid_citations_pass(conn, document):
+    """Ссылки на фрагменты из контекста — без нарушений."""
     violations = citations.verify_citations(
-        conn, card, context_chunk_ids=chunk_ids
+        conn, _card("citec1", "citec2"), ["citec1", "citec2"]
     )
     assert violations == []
 
 
-def test_unknown_chunk_is_violation(conn, chunk_ids):
+def test_unknown_chunk_rejected(conn, document):
     """Ссылка на несуществующий фрагмент — нарушение."""
-    card = _card(_free_chunk_id(conn))
+    violations = citations.verify_citations(conn, _card("ghost000000"), ["citec1"])
+    assert any("не существует" in violation for violation in violations)
+
+
+def test_out_of_context_chunk_rejected(conn, document):
+    """Фрагмент есть в базе, но не был в контексте — нарушение."""
+    violations = citations.verify_citations(conn, _card("citec2"), ["citec1"])
+    assert any("не входил" in violation for violation in violations)
+
+
+def test_duplicate_citation_checked_once(conn, document):
+    """Повторная ссылка на тот же битый фрагмент — одно нарушение."""
     violations = citations.verify_citations(
-        conn, card, context_chunk_ids=chunk_ids
+        conn, _card("ghost000000", "ghost000000"), ["citec1"]
     )
     assert len(violations) == 1
-    assert "не существует" in violations[0]
 
 
-def test_existing_chunk_outside_context_is_violation(conn, chunk_ids):
-    """Ссылка на существующий, но не поданный фрагмент — выдумывание."""
-    card = _card(chunk_ids[0])
-    violations = citations.verify_citations(
-        conn, card, context_chunk_ids=[chunk_ids[1]]
-    )
-    assert len(violations) == 1
-    assert "не входил" in violations[0]
-
-
-def test_mixed_sources_report_each_problem_once(conn, chunk_ids):
-    """Строка нарушения на каждую битую ссылку; дубль не дублируется."""
-    card = _card(chunk_ids[0], chunk_ids[0], _free_chunk_id(conn))
-    violations = citations.verify_citations(
-        conn, card, context_chunk_ids=[chunk_ids[1]]
-    )
-    assert len(violations) == 2  # валидная ссылка и её дубль — один раз
+def test_card_without_sources_passes(conn, document):
+    """Карточка без ссылок не нарушает ничего."""
+    assert citations.verify_citations(conn, _card(), ["citec1"]) == []

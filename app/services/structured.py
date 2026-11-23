@@ -1,219 +1,107 @@
-"""Разбор ответов модели: ответ — это строка, и она грязная.
+"""Валидация ответа LLM по строгому контракту + лечение невалидных ответов.
 
-Четыре случая, которые разбор обязан пережить:
-1. чистый JSON;
-2. JSON в markdown-заборе (```json ... ```);
-3. JSON с текстом до и/или после («Вот ответ: {...} Надеюсь, помог»);
-4. мусор или пустая строка — понятная ошибка, а не падение.
+Три уровня надёжности structured output:
+1. parse_llm_json — достаём JSON из «грязного» ответа модели.
+2. validate_or_retry — при ошибке шлём её текст обратно модели
+   (число исправлений ограничено MAX_FIX_ATTEMPTS).
+3. regenerate_field — чиним одно сломанное поле, не перегенерируя карточку.
+
+Схема дублируется текстом в промпте (schema_instructions): LM Studio не
+поддерживает strict JSON mode, а грамматика structured output обнуляет
+свободные dict (ADR-0004), поэтому output_type агентам не задаётся.
 """
 import json
-import re
-from typing import TypeVar
 
-from agents.exceptions import ModelBehaviorError
 from pydantic import BaseModel, ValidationError
 
+from app.agents.prompts import fixer_agent, generator_agent
 from app.core.config import settings
 from app.core.logging import get_logger
 from app.llm.client import run_agent
+from app.schemas.cards import CardDraft
+from app.services.json_utils import LLMJsonError, parse_llm_json
 
 log = get_logger(__name__)
 
-ModelT = TypeVar("ModelT", bound=BaseModel)
+MAX_FIX_ATTEMPTS = 2
+CONFIDENCE_GATE = settings.card_confidence_threshold
 
-_FENCE_PATTERN = re.compile(r"```(?:json)?\s*(.*?)```", re.DOTALL)
+# Старое имя ошибки разбора — псевдоним канонического LLMJsonError.
+ResponseParseError = LLMJsonError
 
 
-class ResponseParseError(ValueError):
-    """Ответ модели не содержит разбираемого JSON."""
+class CardValidationError(Exception):
+    """Карточку не удалось валидировать за отведённые попытки."""
 
 
 def extract_json(raw_text: str) -> str:
     """Вытащить JSON-строку из грязного ответа модели.
 
     Возвращает строку, пригодную для json.loads / model_validate_json.
-    Бросает ResponseParseError, если JSON найти не удалось.
+    Бросает LLMJsonError (он же ResponseParseError), если JSON найти
+    не удалось.
     """
-    cleaned = (raw_text or "").strip()
-    if not cleaned:
-        raise ResponseParseError("пустой ответ модели")
-
-    candidates: list[str] = []
-    fence_match = _FENCE_PATTERN.search(cleaned)
-    if fence_match:
-        candidates.append(fence_match.group(1).strip())
-    candidates.append(cleaned)
-    brace_start = cleaned.find("{")
-    brace_end = cleaned.rfind("}")
-    if brace_start != -1 and brace_end > brace_start:
-        candidates.append(cleaned[brace_start:brace_end + 1])
-
-    for candidate in candidates:
-        try:
-            json.loads(candidate)
-            return candidate
-        except json.JSONDecodeError:
-            continue
-    raise ResponseParseError(
-        f"в ответе модели нет валидного JSON: {cleaned[:120]!r}"
-    )
+    return json.dumps(parse_llm_json(raw_text), ensure_ascii=False)
 
 
 def schema_instructions(output_model: type[BaseModel]) -> str:
     """Текстовая копия JSON-схемы для инструкции агента.
 
-    Схема в запрос не передаётся (output_type у агентов убран на шаге 8:
-    грамматика LM Studio обнуляет свободные dict) — модель видит форму
-    ответа только текстом, грязный JSON разбирает extract_json.
+    Схема в запрос не передаётся (output_type у агентов убран: грамматика
+    LM Studio обнуляет свободные dict) — модель видит форму ответа только
+    текстом, грязный JSON разбирает parse_llm_json.
     """
     schema_json = json.dumps(
         output_model.model_json_schema(), ensure_ascii=False, indent=2
     )
-    return (
-        "Верни СТРОГО JSON по этой схеме:\n```json\n"
-        + schema_json
-        + "\n```"
-    )
+    return "Верни СТРОГО JSON по этой схеме:\n```json\n" + schema_json + "\n```"
 
 
-async def call_validated(
-    agent,
-    prompt: str,
-    output_model: type[ModelT],
-    max_attempts: int | None = None,
-) -> ModelT:
-    """Вызвать модель и вернуть валидированный объект.
+async def validate_or_retry(prompt: str, feedback_prefix: str = "") -> CardDraft:
+    """Сгенерировать карточку и провалидировать; при ошибке — повтор с текстом ошибки.
 
-    Невалидный ответ не выбрасывается: если сломано одно поле —
-    точечная переделка (repair_field), иначе ответ уходит обратно
-    в модель с текстом ошибки. Число попыток ограничено настройкой
-    validation_max_attempts, после исчерпания — последняя ошибка.
+    feedback_prefix — замечания критика (если это регенерация пайплайна).
+    Бросает CardValidationError после MAX_FIX_ATTEMPTS неудачных исправлений.
     """
-    attempts_limit = max_attempts or settings.validation_max_attempts
-    current_prompt = prompt
+    current_prompt = feedback_prefix + prompt
     last_error: Exception | None = None
-    for attempt in range(1, attempts_limit + 1):
+    for attempt in range(MAX_FIX_ATTEMPTS + 1):
+        raw_output = await run_agent(generator_agent, current_prompt)
         try:
-            raw_output = await run_agent(agent, current_prompt)
-        except ModelBehaviorError as sdk_error:
-            # SDK разбирает output_type сам и падает ДО нашего extract_json —
-            # для лечения это эквивалент невалидного ответа.
-            last_error = ResponseParseError(
-                f"модель вернула невалидный JSON ({sdk_error})"
+            data = parse_llm_json(raw_output)
+            return CardDraft.model_validate(data)
+        except (LLMJsonError, ValidationError) as error:
+            last_error = error
+            log.warning(
+                "card_validation_failed", attempt=attempt + 1, error=str(error)[:300]
             )
-            log.info(
-                "validation_healing_retry",
-                attempt=attempt,
-                error=str(sdk_error)[:200],
+            current_prompt = (
+                f"Твой предыдущий ответ невалиден. Ошибка валидации:\n{error}\n\n"
+                f"Исправь и верни СТРОГО валидный JSON карточки по контракту. "
+                f"Предыдущий запрос:\n{current_prompt}"
             )
-            current_prompt = _repair_prompt(
-                prompt, "<ответ не разобран SDK>", last_error
-            )
-            continue
-        if isinstance(raw_output, output_model):
-            return raw_output
-        json_text = ""
-        try:
-            json_text = extract_json(str(raw_output))
-            return output_model.model_validate_json(json_text)
-        except (ResponseParseError, ValidationError) as validation_error:
-            last_error = validation_error
-            if isinstance(validation_error, ValidationError) and json_text:
-                broken_fields = {
-                    error_info["loc"][0]
-                    for error_info in validation_error.errors()
-                    if error_info["loc"]
-                }
-                if len(broken_fields) == 1:
-                    repaired = await _try_repair_field(
-                        agent, output_model, json_text,
-                        str(broken_fields.pop()), validation_error,
-                    )
-                    if repaired is not None:
-                        return repaired
-            log.info(
-                "validation_healing_retry",
-                attempt=attempt,
-                error=str(validation_error)[:200],
-            )
-            current_prompt = _repair_prompt(
-                prompt, str(raw_output), validation_error
-            )
-    raise last_error
+    raise CardValidationError(f"карточка не прошла валидацию: {last_error}")
 
 
-async def _try_repair_field(
-    agent,
-    output_model: type[ModelT],
-    json_text: str,
-    field_name: str,
-    error: ValidationError,
-) -> ModelT | None:
-    """Попробовать точечно исправить единственное битое поле.
+async def regenerate_field(draft: CardDraft, field: str, error: str) -> CardDraft:
+    """Точечная регенерация: чиним одно поле, остальное остаётся как есть.
 
-    Черновик собирается в обход валидаторов (model_construct) — битый
-    объект иначе не создать. Возвращает None, если переделка не вышла:
-    тогда сработает обычное лечение полным повторным запросом.
+    Дешевле полной регенерации: модель получает текущий черновик
+    и конкретную ошибку.
     """
-    draft = output_model.model_construct(**json.loads(json_text))
-    try:
-        repaired_card = await repair_field(
-            agent, draft, field_name, str(error)
-        )
-        return repaired_card
-    except (ResponseParseError, ValidationError, json.JSONDecodeError, ModelBehaviorError) as repair_error:
-        log.info(
-            "field_repair_failed",
-            field=field_name,
-            error=str(repair_error)[:200],
-        )
-        return None
-
-
-def _repair_prompt(
-    original_prompt: str, bad_output: str, error: Exception
-) -> str:
-    """Промпт лечения: исходная задача + битый ответ + текст ошибки."""
-    return (
-        original_prompt
-        + "\n\nТвой предыдущий ответ не прошёл проверку."
-        + f"\nОтвет:\n{bad_output[:500]}"
-        + f"\nОшибка: {error}"
-        + "\nИсправь ошибку и верни ТОЛЬКО валидный JSON, без markdown."
+    prompt = (
+        "В черновике карточки поле "
+        f"{field!r} не прошло валидацию:\n{error}\n\n"
+        "Текущий черновик (JSON):\n"
+        + draft.model_dump_json(indent=2)
+        + "\n\nПерегенерируй ТОЛЬКО это поле, остальное верни без изменений. "
+        "Ответ — полный JSON карточки."
     )
+    raw_output = await run_agent(fixer_agent, prompt)
+    data = parse_llm_json(raw_output)
+    return CardDraft.model_validate(data)
 
 
-async def repair_field(
-    agent,
-    card: ModelT,
-    field_name: str,
-    issue: str,
-) -> ModelT:    
-    """Точечно переделать одно поле карточки, не трогая остальные.
-
-    Модель получает текущий черновик и текст проблемы, возвращает
-    JSON с одним исправленным полем. Остальные поля берутся из
-    черновика без изменений. Результат проходит полную валидацию
-    схемой — исправление одного поля не должно ломать инварианты.
-
-    Черновик может быть собран через model_construct (в обход
-    валидаторов), поэтому warnings сериализатора отключены: финальная
-    model_validate всё равно проверит и приведёт каждое поле.
-    """
-    repair_prompt = (
-        "Текущий черновик карточки:\n"
-        + card.model_dump_json(indent=2, warnings=False)
-        + f"\n\nПоле «{field_name}» не прошло проверку: {issue}"
-        + f'\nВерни СТРОГО JSON с одним полем: {{"{field_name}": <исправленное значение>}}'
-        + "\nНикакого markdown, только валидный JSON."
-    )
-    log.info("field_repair_start", field=field_name, issue=issue[:120])
-    raw_output = await run_agent(agent, repair_prompt)
-    patch = json.loads(extract_json(str(raw_output)))
-    if field_name not in patch:
-        raise ResponseParseError(
-            f"модель не вернула исправленное поле «{field_name}»: "
-            f"{str(raw_output)[:120]!r}"
-        )
-    patched_card = card.model_copy(update={field_name: patch[field_name]})
-    return type(card).model_validate(patched_card.model_dump(warnings=False))
+def confidence_gate(draft: CardDraft) -> str:
+    """Низкая уверенность → карточка требует ручной проверки."""
+    return "needs_review" if draft.confidence < CONFIDENCE_GATE else "done"

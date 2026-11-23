@@ -11,7 +11,7 @@ from datetime import UTC, datetime
 import psycopg
 from pydantic import ValidationError
 
-from app.schemas.cards import GuardrailReport, ProductCard
+from app.schemas.cards import CardDraft, GuardrailReport
 
 
 def _now() -> str:
@@ -45,7 +45,7 @@ def create_job(
 
 
 def set_status(
-    conn: psycopg.Connection, job_id: str, status: str, *, result: ProductCard | None = None,
+    conn: psycopg.Connection, job_id: str, status: str, *, result: CardDraft | None = None,
     error: str | None = None, bump_attempts: bool = False,
     guardrail_report: GuardrailReport | None = None,
 ) -> None:
@@ -85,9 +85,9 @@ def get_job(conn: psycopg.Connection, job_id: str) -> dict | None:
         # psycopg3 возвращает JSONB уже как dict, а не строку
         try:
             draft = (
-                ProductCard.model_validate(row[3])
+                CardDraft.model_validate(row[3])
                 if isinstance(row[3], dict)
-                else ProductCard.model_validate_json(row[3])
+                else CardDraft.model_validate_json(row[3])
             )
             job_info["result"] = draft.model_dump()
         except ValidationError:

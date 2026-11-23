@@ -43,7 +43,11 @@ async def upload_document(file: UploadFile):
 
     with connection() as conn:
         document_id, created = documents_repo.create_document(
-            conn, file.filename or file_path.name, str(file_path), content_hash
+            conn,
+            file.filename or file_path.name,
+            str(file_path),
+            content_hash,
+            kind=extension.lstrip("."),
         )
         document = documents_repo.get_document(conn, document_id)
     if created:

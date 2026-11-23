@@ -60,7 +60,7 @@ async def evaluate_document(filename: str, entry: dict) -> dict:
         [document_id], hint=entry.get("product")
     )
     context, _chunk_ids = cards_service.assemble_context(results)
-    card = await pipeline.generate_card(context)
+    card = await cards_service.generate_card(context)
     verdict = await pipeline.judge_faithfulness(context, card)
     chunks_by_id = _card_chunks(card)
     return {
@@ -90,14 +90,14 @@ def _ensure_document(filename: str) -> str:
     return document_id
 
 
-def _card_chunks(card) -> dict[int, dict]:
+def _card_chunks(card) -> dict[str, dict]:
     """Фрагменты-источники карточки из базы, по id — для проб цитирования."""
     chunks = {}
     with connection() as conn:
         for source in card.sources:
             chunk = chunks_repo.get_chunk(conn, source.chunk_id)
             if chunk is not None:
-                chunks[chunk["id"]] = chunk
+                chunks[chunk["chunk_id"]] = chunk
     return chunks
 
 

@@ -17,7 +17,8 @@
 - PostgreSQL 16 + pgvector — векторный и полнотекстовый поиск, гибрид со слиянием рангов (RRF)
 - Temporal — оркестрация процессов: разбор документов, генерация карточки, сигналы approve/reject
 - LM Studio — локальные LLM: основная (генерация) и служебная (критик, судья, детектор инъекций)
-- sentence-transformers (`intfloat/multilingual-e5-small`) — эмбеддинги локально
+- sentence-transformers (`google/embeddinggemma-300m`) — эмбеддинги локально
+- uv — зависимости из файла блокировки (`uv sync --frozen`)
 - pytest, ruff
 
 ## Требования
@@ -25,10 +26,12 @@
 - Docker и docker compose
 - Python 3.12+
 - LM Studio с запущенным сервером (`http://localhost:1234`) и двумя загруженными моделями:
-  - основная: `unsloth/qwen3-4b-instruct-2507`
+  - основная: `qwen3-4b-instruct-2507`
   - служебная: `llama-3.2-3b-instruct`
 
-  Имена моделей можно поменять в `.env`.
+  Имена — как в выдаче `GET /v1/models` LM Studio (без HF-префиксов
+  вроде `unsloth/`): с префиксом Agents SDK принял бы имя за провайдера
+  и упал бы с `Unknown prefix`. Поменять можно в `.env`.
 
 ## Установка и запуск с нуля
 
@@ -36,22 +39,19 @@
 git clone https://github.com/Angmarec398/llm-developer-project-432.git
 cd llm-developer-project-432
 
-python -m venv .venv
-source .venv/Scripts/activate   # Windows (Git Bash); Linux/macOS: source .venv/bin/activate
-pip install -r requirements.txt -r requirements-dev.txt
+uv sync --frozen                  # зависимости из uv.lock (нужен uv: https://docs.astral.sh/uv/)
+cp .env.example .env              # при необходимости поправьте имена моделей
 
-cp .env.example .env            # при необходимости поправьте имена моделей
-
-docker compose up -d            # postgres+pgvector, temporal, temporal-ui (:8233)
-make migrate                    # миграции БД
-make api                        # FastAPI на :8000 — терминал 1
-make worker                     # temporal-воркер — терминал 2
+docker compose up -d              # postgres+pgvector, temporal, temporal-ui (:8233)
+make migrate                      # миграции БД
+make api                          # FastAPI на :8000 — терминал 1
+make worker                       # temporal-воркер — терминал 2
 ```
 
 Проверка: `curl localhost:8000/health` → `{"status":"ok"}`;
 `curl localhost:8000/health/ready` → база доступна и расширение vector активно.
 
-При первом запуске sentence-transformers скачает модель эмбеддингов (~0.5 ГБ).
+При первом запуске sentence-transformers скачает модель эмбеддингов embeddinggemma-300m.
 
 ## Использование
 
@@ -113,7 +113,7 @@ app/
 ├── parsers/           # pdf/docx/xlsx, нормализация, чанкинг
 ├── guardrails/        # персональные данные, инъекции, фильтр выхода
 ├── repositories/      # весь SQL
-├── schemas/           # ProductCard, JobOut и др.
+├── schemas/           # CardDraft, JobOut и др.
 └── temporal/          # workflow, activities, клиент
 db/migrations/         # SQL-миграции (раннер — app/core/migrate.py)
 evals/                 # метрики качества
@@ -141,7 +141,7 @@ docs/adr/              # архитектурные решения
 ## Отчёт о приёмочном прогоне (22.11.2026)
 
 Прогон с нуля: тома удалены (`docker compose down -v`), инфраструктура поднята заново,
-6 миграций применены на чистую базу, все 5 выданных документов загружены, карточки
+8 миграций применены на чистую базу, все 5 выданных документов загружены, карточки
 сгенерированы. Прогон поймал дефект, невидимый в «тёплом» окружении: при пустом
 результате поиска задача сообщала «все фрагменты отклонены детектором инъекций» —
 теперь ошибка честная: «поиск не вернул ни одного фрагмента по выбранным документам».

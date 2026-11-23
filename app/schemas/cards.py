@@ -2,7 +2,105 @@ from typing import Literal
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
-TITLE_MAX_LENGTH = 60
+
+class SupplierFacts(BaseModel):
+    """Результат extractor-агента: структурированные факты из текста поставщика."""
+
+    product_name: str = Field(description="Название товара из текста поставщика")
+    characteristics: dict[str, str] = Field(
+        default_factory=dict, description="Характеристики: ключ-значение"
+    )
+    missing_fields: list[str] = Field(
+        default_factory=list,
+        description="Что не найдено в тексте (например: гарантия, цвет)",
+    )
+
+
+class SourceRef(BaseModel):
+    """Ссылка на источник утверждения: конкретный чанк документа.
+
+    chunk_id — идентификатор чанка в базе: карточка обязана сослаться
+    на чанк из поданного контекста, а приложение потом проверяет, что
+    чанк существует и был именно в этом контексте.
+    """
+
+    chunk_id: str = Field(description="Идентификатор чанка в БД")
+    doc_id: str = Field(default="", description="Идентификатор документа")
+    page: int | None = Field(default=None, description="Страница источника")
+    score: float | None = Field(default=None, description="Релевантность чанка")
+
+
+class Seo(BaseModel):
+    """SEO-блок карточки."""
+
+    title: str = Field(default="", description="SEO-заголовок до 100 символов")
+    description: str = Field(default="", description="SEO-описание до 200 символов")
+    keywords: list[str] = Field(default_factory=list)
+
+
+class CardDraft(BaseModel):
+    """Результат generator-агента: черновик карточки товара.
+
+    Полный контракт карточки: контент-поля, SEO-блок, цитирование
+    источников, честность о неполноте данных и самооценка уверенности.
+    """
+
+    title: str = Field(description="Заголовок карточки, до 60 символов")
+    description: str = Field(description="Описание на 3-4 предложения")
+    characteristics: dict[str, str] = Field(default_factory=dict)
+    benefits: list[str] = Field(default_factory=list)
+    seo: Seo = Field(default_factory=Seo)
+    sources: list[SourceRef] = Field(
+        default_factory=list,
+        description="Источники утверждений: chunk_id + doc_id + page",
+    )
+    missing_fields: list[str] = Field(
+        default_factory=list,
+        description="Что важно для карточки, но данных нет; поле НЕ выдумывать",
+    )
+    confidence: float = Field(
+        default=0.5,
+        description="Самооценка модели: 0.0 — данных нет, 1.0 — всё подтверждено",
+    )
+
+    @field_validator("title")
+    @classmethod
+    def title_max_length(cls, value: str) -> str:
+        """Заголовок длиннее 60 символов отклоняется с явной ошибкой."""
+        if len(value) > 60:
+            raise ValueError(
+                f"заголовок длиннее 60 символов ({len(value)}): сократи"
+            )
+        return value
+
+    @field_validator("confidence")
+    @classmethod
+    def confidence_range(cls, value: float) -> float:
+        """Уверенность — число от нуля до единицы."""
+        if not 0.0 <= value <= 1.0:
+            raise ValueError("confidence должен быть в [0.0, 1.0]")
+        return value
+
+    @field_validator("characteristics")
+    @classmethod
+    def no_empty_characteristics(cls, value: dict[str, str]) -> dict[str, str]:
+        """Характеристики с пустыми значениями молча выбрасываются."""
+        return {
+            key: characteristic
+            for key, characteristic in value.items()
+            if str(characteristic).strip()
+        }
+
+    @model_validator(mode="after")
+    def missing_fields_not_in_characteristics(self) -> "CardDraft":
+        """Ключ не может быть одновременно в characteristics и missing_fields."""
+        duplicates = set(self.missing_fields) & set(self.characteristics.keys())
+        if duplicates:
+            raise ValueError(
+                f"поля одновременно в characteristics и missing_fields: "
+                f"{sorted(duplicates)}"
+            )
+        return self
 
 
 class CritiqueReport(BaseModel):
@@ -16,6 +114,7 @@ class CritiqueReport(BaseModel):
         description="Список проблем: заголовок длиннее 60 символов, "
         "выдуманные характеристики, пустые поля и т.п.",
     )
+
     @field_validator("issues", mode="before")
     @classmethod
     def _coerce_issue_items(cls, value: list) -> list[str]:
@@ -46,71 +145,9 @@ class JobIn(BaseModel):
     )
 
 
-class CardSeo(BaseModel):
-    """SEO-блок карточки."""
-    slug: str          # URL-часть
-    keywords: list[str] = Field(default_factory=list)
-
-
-class CardSource(BaseModel):
-    """Ссылка на фрагмент-источник данных карточки.
-
-    chunk_id — идентификатор фрагмента в базе: карточка обязана
-    сослаться на фрагмент из поданного контекста, а приложение
-    потом проверяет, что фрагмент существует и был именно в этом
-    контексте. document — читаемое название документа для человека.
-    """
-
-    chunk_id: int      # id фрагмента в базе — по нему проверяется ссылка
-    document: str      # название/идентификатор документа (читаемое)
-    url: str | None = None
-
-
-class ProductCard(BaseModel):
-    """Финальная карточка товара — контракт шагов 4 и 7.
-
-    Каждое утверждение карточки опирается на фрагменты-источники:
-    модель обязана вернуть их в sources, проверка ссылок гарантирует,
-    что фрагменты существуют и были видны модели в контексте.
-    """
-    title: str = Field(max_length=TITLE_MAX_LENGTH)
-    description: str
-    characteristics: dict[str, str] = Field(default_factory=dict)
-    benefits: list[str] = Field(default_factory=list)
-    seo: CardSeo
-    sources: list[CardSource] = Field(min_length=1)
-    confidence: float = Field(ge=0.0, le=1.0)
-    missing_fields: list[str] = Field(default_factory=list)
-
-    @field_validator("characteristics")
-    @classmethod
-    def _no_empty_values(cls, value: dict[str, str]) -> dict[str, str]:
-        """Отвергнуть характеристики с пустыми значениями."""
-        empty_keys = [
-            key for key, characteristic_value in value.items()
-            if not characteristic_value.strip()
-        ]
-        if empty_keys:
-            raise ValueError(
-                f"пустые значения у характеристик: {', '.join(empty_keys)}"
-            )
-        return value
-
-    @model_validator(mode="after")
-    def _not_in_both_lists(self) -> "ProductCard":
-        """Ключ не может быть одновременно в characteristics и missing_fields."""
-        both = set(self.characteristics) & set(self.missing_fields)
-        if both:
-            raise ValueError(
-                "поля и в характеристиках, и в недостающих: "
-                + ", ".join(sorted(both))
-            )
-        return self
-
-
 class FaithfulnessVerdict(BaseModel):
     """Вердикт модели-судьи (шаг 8): какие утверждения карточки
-    подтверждаются фрагментами-источниками, а каких в них нет.
+    подтверждаются чанками-источниками, а каких в них нет.
 
     Судья только размечает; долю считает детерминированный код
     (evals/metrics.py) — оценке модели доверяем как оценке,
@@ -119,28 +156,13 @@ class FaithfulnessVerdict(BaseModel):
 
     supported: list[str] = Field(
         default_factory=list,
-        description="Утверждения карточки, прямо подтверждённые фрагментами",
+        description="Утверждения карточки, прямо подтверждённые чанками",
     )
     unsupported: list[str] = Field(
         default_factory=list,
-        description="Утверждения, которых во фрагментах нет",
+        description="Утверждения, которых в чанках нет",
     )
 
-class InjectionVerdict(BaseModel):
-    """Вердикт точного уровня детектора инъекций (шаг 9): содержит ли
-    фрагмент попытку манипуляции инструкциями ИИ. Заполняет дешёвая
-    служебная модель; решает только второй уровень, первый — правила
-    (app/guardrails/injection.py), которые и решают, идти ли в модель.
-    """
-
-    is_injection: bool = Field(
-        description="true — фрагмент содержит попытку манипуляции "
-        "инструкциями ИИ"
-    )
-    reason: str = Field(
-        default="",
-        description="что именно подозрительного найдено во фрагменте",
-    )
 
 class MaskedItem(BaseModel):
     """Замаскированное ПДн в отчёте защиты (шаг 9): категория и метка.
@@ -151,29 +173,29 @@ class MaskedItem(BaseModel):
     """
 
     category: str      # phone | email | taxpayer_number | card_number
-    label: str         # «телефон номер один»
+    label: str         # метка-заглушка, подставленная в текст
 
 
 class ExcludedChunk(BaseModel):
-    """Фрагмент, исключённый из контекста детектором инъекций."""
+    """Чанк, исключённый из контекста детектором инъекций."""
 
-    chunk_id: int
-    document_id: str
+    chunk_id: str
+    doc_id: str
     reasons: list[str] = Field(default_factory=list)
 
 
 class QuarantinedDocument(BaseModel):
-    """Документ, отозванный к человеку: подозрительных фрагментов
-    больше порога (настройка injection_document_threshold)."""
+    """Документ, отозванный к человеку: подозрительных чанков
+    больше порога (настройка suspicious_chunk_limit)."""
 
-    document_id: str
+    doc_id: str
     reason: str
 
 
 class GuardrailReport(BaseModel):
     """Отчёт защитных рубежей (шаг 9) — часть результата задачи.
 
-    Что замаскировано на входе (masked), какие фрагменты исключены
+    Что замаскировано на входе (masked), какие чанки исключены
     (excluded_chunks), какие документы в карантине (quarantined_
     documents), что замаскировано в готовой карточке (output_masked).
     Только метки и причины, без сырых значений ПДн.

@@ -6,11 +6,11 @@ from psycopg_pool import PoolTimeout
 from app.core.db import connection
 from app.repositories import jobs as jobs_repo
 from app.schemas.cards import (
-    CardSeo,
-    CardSource,
+    CardDraft,
     GuardrailReport,
     MaskedItem,
-    ProductCard,
+    Seo,
+    SourceRef,
 )
 
 
@@ -60,18 +60,18 @@ def test_set_status_and_get_job(conn, job_ids):
     job_id, _ = jobs_repo.create_job(conn, {"supplier_text": "x"}, None)
     job_ids.append(job_id)
     jobs_repo.set_status(conn, job_id, "generating", bump_attempts=True)
-    card = ProductCard(
-        title="Чайник",
+    card = CardDraft(
+        title="Чайник 2200 Вт",
         description="Описание",
-        seo=CardSeo(slug="chainik"),
-        sources=[CardSource(chunk_id=1, document="supplier_text")],
+        seo=Seo(title="Чайник"),
+        sources=[SourceRef(chunk_id="abc123def456", doc_id="doc1")],
         confidence=0.9,
     )
     jobs_repo.set_status(conn, job_id, "approved", result=card)
     job = jobs_repo.get_job(conn, job_id)
     assert job["status"] == "approved"
     assert job["attempts"] == 1
-    assert job["result"]["title"] == "Чайник"
+    assert job["result"]["title"] == "Чайник 2200 Вт"
     assert job["result"]["confidence"] == 0.9
 
 
@@ -79,14 +79,15 @@ def test_get_job_missing(conn):
     """Запрос несуществующей задачи возвращает None."""
     assert jobs_repo.get_job(conn, "no-such-id") is None
 
+
 def test_set_status_stores_guardrail_report(conn, job_ids):
-    """Отчёт защиты сохраняется в задаче и читается обратно (шаг 9)."""
+    """Отчёт защиты сохраняется в задаче и читается обратно."""
     job_id, _ = jobs_repo.create_job(conn, {"supplier_text": "x"}, None)
     job_ids.append(job_id)
     report = GuardrailReport(
-        masked=[MaskedItem(category="phone", label="телефон номер один")]
+        masked=[MaskedItem(category="phone", label="[PHONE_1]")]
     )
     jobs_repo.set_status(conn, job_id, "done", guardrail_report=report)
     job = jobs_repo.get_job(conn, job_id)
     assert job["guardrail_report"]["masked"][0]["category"] == "phone"
-    assert job["guardrail_report"]["masked"][0]["label"] == "телефон номер один"
+    assert job["guardrail_report"]["masked"][0]["label"] == "[PHONE_1]"

@@ -5,7 +5,7 @@
 retry-политика, таймаут, различие ошибок 429/5xx/4xx — всё здесь.
 Сервисы вызывают run_agent() и не знают про провайдера.
 
-Учёт (шаг 8): после каждого успешного вызова клиент САМ пишет строку
+Учёт: после каждого успешного вызова клиент САМ пишет строку
 в таблицу llm_calls — задача из контекста, токены из ответа, длительность,
 стоимость из цен настроек. Вызывающий код учесть вызов не может забыть:
 все вызовы идут через одну границу.
@@ -18,8 +18,6 @@ from decimal import Decimal
 import httpx
 from agents import (
     Agent,
-    MultiProvider,
-    RunConfig,
     Runner,
     set_default_openai_api,
     set_default_openai_client,
@@ -36,14 +34,13 @@ from app.repositories import llm_calls as llm_calls_repo
 log = get_logger(__name__)
 
 _client_configured = False
-_model_provider: MultiProvider | None = None
 
 
 def setup_llm() -> None:
-    """Инициализация OpenAI-compatible клиента (LM Studio / OpenRouter / Z.ai).
+    """Инициализация OpenAI-compatible клиента (LM Studio / OpenRouter).
     Вызывается один раз на процесс. Идемпотентна.
     """
-    global _client_configured, _model_provider
+    global _client_configured
     if _client_configured:
         return
     # keep-alive отключён: LM Studio рвёт простаивающие соединения (RST),
@@ -63,15 +60,6 @@ def setup_llm() -> None:
     set_default_openai_api("chat_completions")
     # иначе 401 на не-OpenAI ключе
     set_tracing_disabled(True)
-    # Провайдер создаётся ЗДЕСЬ, а не на уровне модуля: его внутренний
-    # OpenAIProvider жадно запоминает use_responses на момент конструирования,
-    # а без явного openai_use_responses=False берёт глобальный дефолт SDK
-    # (True) и уходит на /v1/responses, минуя настройку выше.
-    _model_provider = MultiProvider(
-        unknown_prefix_mode="model_id",
-        openai_client=client,
-        openai_use_responses=False,
-    )
     _client_configured = True
 
 
@@ -98,11 +86,7 @@ async def run_agent(agent: Agent, prompt: str):
         try:
             started_at = time.monotonic()
             result = await asyncio.wait_for(
-                Runner.run(
-                    agent,
-                    prompt,
-                    run_config=RunConfig(model_provider=_model_provider),
-                ),
+                Runner.run(agent, prompt),
                 timeout=settings.llm_timeout_s,
             )
             _record_call(agent, result, started_at)
@@ -166,7 +150,7 @@ def _record_call(agent: Agent, result, started_at: float) -> None:
 def _prices_for(model: str) -> tuple[Decimal, Decimal]:
     """Цены за миллион токенов для модели: служебная — дешёвые, остальные — основные.
 
-    Политика двух моделей (шаг 8): критик, судья и починка полей идут
+    Политика двух моделей: критик, судья и починка полей идут
     на llm_model_utility с её ценами; генерация карточки — на основную.
     """
     if model == settings.llm_model_utility:

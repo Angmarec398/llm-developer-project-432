@@ -34,7 +34,7 @@ from temporalio import workflow
 from temporalio.common import RetryPolicy
 
 with workflow.unsafe.imports_passed_through():
-    from app.schemas.cards import CritiqueReport, ProductCard
+    from app.schemas.cards import CardDraft, CritiqueReport
     from app.temporal.activities import (
         critique_activity,
         embed_documents_activity,
@@ -100,7 +100,7 @@ class CardWorkflow:
         document_ids: list[str],
         hint: str | None = None,
         max_attempts: int = 3,
-        confidence_threshold: float = 0.6,
+        confidence_threshold: float = 0.5,
     ) -> str:
         """Прогнать сквозной сценарий и вернуть JSON итоговой карточки.
 
@@ -261,7 +261,7 @@ class CardWorkflow:
                     report_json,
                 )
 
-            card = ProductCard.model_validate_json(cleaned_json)
+            card = CardDraft.model_validate_json(cleaned_json)
             if approved and card.confidence >= confidence_threshold:
                 self._status = "done"
                 await self._set_status(

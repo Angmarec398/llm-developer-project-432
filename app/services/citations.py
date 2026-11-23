@@ -1,4 +1,4 @@
-"""Проверка ссылок карточки — второй рубеж против выдумывания (шаг 7).
+"""Проверка ссылок карточки — второй рубеж против выдумывания.
 
 Первый рубеж — сам поиск: модель видит только то, что нашлось.
 Второй — эта проверка: модель обязана вернуть источники, но может
@@ -15,13 +15,13 @@
 import psycopg
 
 from app.repositories import chunks as chunks_repo
-from app.schemas.cards import ProductCard
+from app.schemas.cards import CardDraft
 
 
 def verify_citations(
     conn: psycopg.Connection,
-    card: ProductCard,
-    context_chunk_ids: list[int],
+    card: CardDraft,
+    context_chunk_ids: list[str],
 ) -> list[str]:
     """Проверить ссылки карточки, вернуть список нарушений.
 
@@ -32,7 +32,7 @@ def verify_citations(
     """
     known_ids = set(context_chunk_ids)
     violations: list[str] = []
-    checked: set[int] = set()
+    checked: set[str] = set()
     for source in card.sources:
         chunk_id = source.chunk_id
         if chunk_id in checked:

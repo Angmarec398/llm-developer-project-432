@@ -1,87 +1,87 @@
-"""Тесты детекторов ПДн (шаг 9): маскирование, контрольные суммы, ложные срабатывания."""
-from app.guardrails.pii import mask_pii
+"""Тесты маскирования ПДн: метки [KIND_N], ИНН по контрольной сумме,
+сырые значения из модуля не возвращаются."""
+from app.guardrails.pii import _inn_checksum, contains_pii, mask_pii
 
 
-def test_phone_replaced_with_label():
-    """Телефон из эталона уходит, на его месте — метка."""
-    result = mask_pii("Контакты менеджера: +7 926 555-14-08, звоните.")
-    assert "+7 926 555-14-08" not in result.text
-    assert "телефон номер один" in result.text
-    assert [finding.category for finding in result.findings] == ["phone"]
+def test_phone_masked_with_label():
+    """Телефон заменяется меткой [PHONE_1], сырого номера нет."""
+    cleaned, entities = mask_pii("Менеджер: +7 926 555-14-08, звоните")
+    assert "+7 926 555-14-08" not in cleaned
+    assert "[PHONE_1]" in cleaned
+    assert entities[0].kind == "phone"
+    assert entities[0].placeholder == "[PHONE_1]"
 
 
-def test_phone_format_with_brackets_and_8():
-    """Другие российские записи того же номера тоже ловятся."""
-    result = mask_pii("Тел.: 8 (926) 555-14-08 или +7(926)5551408")
-    assert "8 (926) 555-14-08" not in result.text
-    assert "+7(926)5551408" not in result.text
-    assert result.text.count("телефон") == 2
+def test_phone_format_with_8():
+    """Номер через восьмёрку тоже маскируется."""
+    cleaned, _ = mask_pii("тел. 8 900 123 45 67")
+    assert "8 900 123 45 67" not in cleaned
 
 
 def test_email_masked():
-    """Почта менеджера из эталона уходит, метка на месте."""
-    result = mask_pii("Пишите: a.smirnova@technodom.example — отвечу.")
-    assert "a.smirnova@technodom.example" not in result.text
-    assert "электронная почта номер один" in result.text
+    """Почта заменяется меткой [EMAIL_1]."""
+    cleaned, entities = mask_pii("пишите на a.smirnova@technodom.example")
+    assert "a.smirnova@technodom.example" not in cleaned
+    assert "[EMAIL_1]" in cleaned
+    assert entities[0].kind == "email"
 
 
-def test_taxpayer_number_with_valid_checksum_masked():
-    """ИНН из эталона (валидная контрольная сумма) маскируется."""
-    result = mask_pii("Наш ИНН 7712345671, оплатите счёт.")
-    assert "7712345671" not in result.text
-    assert "номер налогоплательщика номер один" in result.text
+def test_inn_with_valid_checksum_masked():
+    """ИНН с верной контрольной суммой маскируется."""
+    assert _inn_checksum("7712345671")
+    cleaned, entities = mask_pii("ИНН компании: 7712345671")
+    assert "7712345671" not in cleaned
+    assert any(entity.kind == "inn" for entity in entities)
 
 
-def test_taxpayer_number_with_bad_checksum_untouched():
-    """Похожая последовательность с битой суммой — НЕ трогаем."""
-    result = mask_pii("Артикул 7712345678 из каталога.")
-    assert result.text == "Артикул 7712345678 из каталога."
-    assert result.findings == []
+def test_inn_with_bad_checksum_untouched():
+    """Десять случайных цифр с неверной суммой — не ИНН, не трогаем."""
+    assert not _inn_checksum("1234567890")
+    cleaned, entities = mask_pii("заказ 1234567890 оформлен")
+    assert "1234567890" in cleaned
+    assert all(entity.kind != "inn" for entity in entities)
 
 
-def test_card_number_with_luhn_masked():
-    """Номер карты с валидным Луна маскируется."""
-    result = mask_pii("Оплата картой 4000 0000 0000 0002.")
-    assert "4000 0000 0000 0002" not in result.text
-    assert "номер карты номер один" in result.text
-
-
-def test_card_number_with_bad_luhn_untouched():
-    """Битый по Луна номер — не находка."""
-    result = mask_pii("Счёт 4000 0000 0000 0003 в документе.")
-    assert result.findings == []
+def test_card_number_masked():
+    """Номер карты (16 цифр группами) маскируется меткой [CARD_1]."""
+    cleaned, entities = mask_pii("карта 4276 5500 1234 5678")
+    assert "4276 5500 1234 5678" not in cleaned
+    assert any(entity.kind == "card" for entity in entities)
 
 
 def test_plain_text_untouched():
-    """Чистый текст без ПДн проходит без изменений."""
-    source = "Чайник электрический, мощность 2200 Вт, объём 1.7 л."
-    result = mask_pii(source)
-    assert result.text == source
-    assert result.findings == []
+    """Текст без ПДн возвращается как есть, сущностей нет."""
+    text = "Блендер МиксерПро 800, мощность 800 Вт"
+    cleaned, entities = mask_pii(text)
+    assert cleaned == text
+    assert entities == []
 
 
-def test_article_sum_date_not_masked():
-    """Артикулы, суммы, даты не маскируются — ИНН-детектор их не берёт."""
-    result = mask_pii(
-        "Артикул BLD-800, цена 2 190 ₽, отгрузка 12.05.2026, поставка 500 шт."
-    )
-    assert result.findings == []
-    assert "BLD-800" in result.text
-    assert "12.05.2026" in result.text
+def test_articul_and_date_not_masked():
+    """Артикулы и даты не принимаются за ПДн."""
+    text = "Артикул BLD-800, поставка 12.05.2026"
+    cleaned, entities = mask_pii(text)
+    assert cleaned == text
+    assert entities == []
 
 
 def test_several_phones_numbered():
-    """Несколько находок одной категории нумеруются словами по порядку."""
-    result = mask_pii("Директор +7 926 555-14-08, бухгалтерия +7 495 111-22-33.")
-    assert "телефон номер один" in result.text
-    assert "телефон номер два" in result.text
-    assert "+7" not in result.text
+    """Несколько телефонов нумеруются по порядку."""
+    cleaned, entities = mask_pii(
+        "первый +7 926 555-14-08, второй +7 916 111-22-33"
+    )
+    assert "[PHONE_1]" in cleaned
+    assert "[PHONE_2]" in cleaned
+    assert len(entities) == 2
 
 
 def test_findings_do_not_store_raw_values():
-    """Находка помнит только категорию и позицию — сырого значения нет."""
-    result = mask_pii("Телефон +7 926 555-14-08.")
-    finding = result.findings[0]
-    assert finding.category == "phone"
-    assert not hasattr(finding, "raw")
-    assert len(vars(finding)) == 3  # category, start, end
+    """Сырое значение наружу не возвращается — только категория и метка."""
+    _, entities = mask_pii("звоните +7 926 555-14-08")
+    assert entities[0].original == ""
+
+
+def test_contains_pii():
+    """Быстрая проверка для фильтра выхода."""
+    assert contains_pii("звони +7 926 555-14-08")
+    assert not contains_pii("мощность 800 Вт")

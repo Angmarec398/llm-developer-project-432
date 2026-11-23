@@ -1,29 +1,29 @@
-"""Разбор DOCX: параграфы, заголовок работает границей секции.
+"""Парсер DOCX: python-docx, параграфы + таблицы, стили-заголовки как секции."""
+import io
 
-Страниц у DOCX нет (вёрстка определяется при открытии), поэтому
-page всегда None; привязка к месту документа идёт через section.
-"""
-from docx import Document
+from docx import Document as DocxDocument
 
-from app.parsers.blocks import Block
+from app.parsers.pdf import Block, _table_to_text
 
 
-def parse_docx(file_path: str) -> list[Block]:
-    """Извлечь параграфы из DOCX с привязкой к секциям.
-
-    Параграф со стилем Heading открывает новую секцию: его текст
-    попадает в метаданные section всех последующих параграфов —
-    по нему потом видно, из какой части документа взят фрагмент.
-    Пустые параграфы пропускаются.
-    """
-    document = Document(file_path)
+def parse_docx(data: bytes) -> list[Block]:
+    """Разобрать DOCX из байтов в блоки; DOCX без пагинации — «страница» 1."""
+    doc = DocxDocument(io.BytesIO(data))
     blocks: list[Block] = []
-    section: str | None = None
-    for paragraph in document.paragraphs:
-        text = paragraph.text.strip()
+    section = ""
+    page = 1
+
+    for para in doc.paragraphs:
+        text = para.text.strip()
         if not text:
             continue
-        if paragraph.style.name.startswith("Heading"):
+        style = (para.style.name or "").lower()
+        if "heading" in style or "заголовок" in style:
             section = text
-        blocks.append(Block(text=text, section=section))
+        blocks.append(Block("text", text, page, section=section))
+
+    for table in doc.tables:
+        rows = [[cell.text.strip() for cell in row.cells] for row in table.rows]
+        blocks.append(Block("table", _table_to_text(rows), page, section=section, rows=rows))
+
     return blocks
